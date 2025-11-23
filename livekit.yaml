@@ -1,0 +1,25 @@
+# LiveKit Server Configuration
+# For local/LAN use (not exposed to internet)
+
+port: 7880
+log_level: info
+
+# API keys for authentication
+keys:
+  devkey: secret
+
+rtc:
+  # Port range for WebRTC UDP traffic
+  port_range_start: 50000
+  port_range_end: 60000
+  # Local network only - no STUN/TURN needed
+  use_external_ip: false
+  # Bind to all interfaces for LAN access
+  tcp_port: 7881
+
+# For production with SSL:
+# turn:
+#   enabled: true
+#   domain: your-domain.com
+#   cert_file: /path/to/cert.pem
+#   key_file: /path/to/key.pem

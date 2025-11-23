@@ -1,0 +1,25 @@
+services:
+  livekit-server:
+    image: livekit/livekit-server:latest
+    container_name: livekit-server
+    network_mode: host  # Required for WebRTC - avoids NAT issues
+    command: --dev --bind 0.0.0.0
+    # For production, use config file instead:
+    # command: --config /etc/livekit.yaml
+    # volumes:
+    #   - ./livekit.yaml:/etc/livekit.yaml:ro
+    environment:
+      # Dev mode uses these defaults:
+      # API Key: devkey
+      # API Secret: secret
+      # For production, set these:
+      # LIVEKIT_KEYS: "your_api_key: your_api_secret"
+      - LIVEKIT_LOG_LEVEL=info
+    restart: unless-stopped
+
+  # Optional: Redis for multi-node setups
+  # redis:
+  #   image: redis:alpine
+  #   container_name: livekit-redis
+  #   ports:
+  #     - "6379:6379"
