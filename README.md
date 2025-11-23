@@ -239,4 +239,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 
-**Built with [Claude Code](https://claude.ai/claude-code)** | Part of the [CAAL Project](https://github.com/CoreyMacWorx)
+**Built with [Claude Code](https://claude.ai/claude-code)**
