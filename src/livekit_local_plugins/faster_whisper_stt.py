@@ -9,7 +9,7 @@ Features:
     - GPU acceleration via CUDA (falls back to CPU)
     - Multiple model sizes (tiny -> large-v3)
     - Configurable beam search and VAD filtering
-    - ~200-400ms latency on RTX 3060 with medium model
+    - DEBUG-level latency logging for benchmarking
 
 Requirements:
     - faster-whisper >= 1.0.0
@@ -28,6 +28,7 @@ Example:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Literal
 
 import numpy as np
@@ -67,10 +68,10 @@ class FasterWhisperSTT(stt.STT):
         beam_size: Beam search width (1-10). Higher = more accurate but slower
         vad_filter: Enable voice activity detection to filter silence
 
-    Performance (RTX 3060, medium model, float16):
-        - Latency: ~200-400ms per utterance
-        - GPU Memory: ~2GB VRAM
-        - Accuracy: ~93-95% WER on conversational speech
+    Performance Notes:
+        - GPU Memory: ~2GB VRAM for medium model
+        - Enable DEBUG logging to see latency metrics
+        - Latency varies by model size, hardware, and audio length
 
     Example:
         >>> from livekit_local_plugins import FasterWhisperSTT
@@ -88,7 +89,7 @@ class FasterWhisperSTT(stt.STT):
 
     def __init__(
         self,
-        model_size: ModelSize = "base",
+        model_size: ModelSize = "medium",
         device: Device = "cuda",
         compute_type: ComputeType = "float16",
         language: str = "en",
@@ -143,6 +144,7 @@ class FasterWhisperSTT(stt.STT):
         lang = language if language is not NOT_GIVEN else self._language
 
         # Run transcription with optimized settings
+        start_time = time.perf_counter()
         segments, info = self._model.transcribe(
             audio_data,
             beam_size=self._beam_size,
@@ -154,9 +156,12 @@ class FasterWhisperSTT(stt.STT):
 
         # Combine all segments into final text
         text = "".join(segment.text for segment in segments).strip()
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
 
         if text:
             logger.debug(f"Transcribed ({info.language}, {info.duration:.1f}s): {text}")
+
+        logger.debug(f"STT latency: {elapsed_ms:.0f}ms for {info.duration:.1f}s audio")
 
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,

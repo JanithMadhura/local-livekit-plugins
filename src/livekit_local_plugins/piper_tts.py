@@ -6,10 +6,11 @@ Local text-to-speech using Piper with optional GPU acceleration.
 No cloud APIs required - runs entirely on your hardware.
 
 Features:
-    - Fast CPU-based synthesis (~200-300ms for typical responses)
+    - Fast CPU-based synthesis
     - Optional GPU acceleration (CUDA version dependent)
     - Multiple voice models available
     - Configurable speed, volume, and voice characteristics
+    - DEBUG-level latency logging for benchmarking
 
 Requirements:
     - piper-tts >= 1.2.0
@@ -36,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import time
 import uuid
 import wave
 from typing import TYPE_CHECKING
@@ -78,12 +80,16 @@ class _PiperChunkedStream(tts.ChunkedStream):
         )
 
         # Run blocking synthesis in thread pool
+        start_time = time.perf_counter()
         loop = asyncio.get_running_loop()
         audio_bytes = await loop.run_in_executor(
             None,
             self._synthesize_blocking,
             self._input_text
         )
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+
+        logger.debug(f"TTS latency: {elapsed_ms:.0f}ms for {len(self._input_text)} chars")
 
         emitter.push(audio_bytes)
 
@@ -137,8 +143,9 @@ class PiperTTS(tts.TTS):
         noise_scale: Phoneme noise scale for variation (0.0-1.0). Default: 0.667
         noise_w: Phoneme width noise scale (0.0-1.0). Default: 0.8
 
-    Performance (CPU, Ryan High model):
-        - Latency: ~200-300ms for typical responses
+    Performance Notes:
+        - CPU is often as fast as GPU for short utterances
+        - Enable DEBUG logging to see latency metrics
         - Quality: Good, clearly synthetic but natural sounding
 
     Popular Voice Models:

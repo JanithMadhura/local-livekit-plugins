@@ -15,10 +15,10 @@ Usage:
 
 Environment Variables:
     USE_LOCAL           - Set to "true" for local pipeline
-    WHISPER_MODEL       - FasterWhisper model size (default: "base")
+    WHISPER_MODEL       - FasterWhisper model size (default: "medium")
     WHISPER_DEVICE      - "cuda" or "cpu" (default: "cuda")
     PIPER_MODEL_PATH    - Path to Piper .onnx model
-    OLLAMA_MODEL        - Ollama model name (default: "llama3.2")
+    OLLAMA_MODEL        - Ollama model name (default: "llama3.1:8b")
     OLLAMA_BASE_URL     - Ollama API URL (default: "http://localhost:11434/v1")
 
 For cloud pipeline:
@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 
 # Add parent directory to path for local development (must be before other imports)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -65,11 +66,11 @@ logger = logging.getLogger("voice-agent")
 USE_LOCAL = os.getenv("USE_LOCAL", "false").lower() == "true"
 
 # Local pipeline settings
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "")
 PIPER_USE_CUDA = os.getenv("PIPER_USE_CUDA", "false").lower() == "true"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 
 
@@ -170,6 +171,30 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     # Create session based on configuration
     session = create_local_session() if USE_LOCAL else create_cloud_session()
+
+    # ==========================================================================
+    # Round-trip latency tracking
+    # ==========================================================================
+    # Measures time from user speech transcribed to agent starting to speak.
+    # This captures: LLM processing + TTS first byte (STT already done).
+
+    _transcription_time: float | None = None
+
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(ev) -> None:
+        nonlocal _transcription_time
+        _transcription_time = time.perf_counter()
+        logger.debug(f"User said: {ev.transcript[:80]}...")
+
+    @session.on("agent_state_changed")
+    def on_agent_state_changed(ev) -> None:
+        nonlocal _transcription_time
+        if ev.new_state == "speaking" and _transcription_time is not None:
+            latency_ms = (time.perf_counter() - _transcription_time) * 1000
+            logger.info(f"ROUND-TRIP LATENCY: {latency_ms:.0f}ms (LLM + TTS)")
+            _transcription_time = None
+
+    # ==========================================================================
 
     # Start the agent session
     await session.start(
