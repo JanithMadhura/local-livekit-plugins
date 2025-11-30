@@ -23,7 +23,7 @@ Note on GPU Acceleration:
     See: https://github.com/rhasspy/piper/discussions/544
 
 Example:
-    >>> from livekit_local_plugins import PiperTTS
+    >>> from local_livekit_plugins import PiperTTS
     >>>
     >>> tts = PiperTTS(
     ...     model_path="/path/to/en_US-ryan-high.onnx",
@@ -154,7 +154,7 @@ class PiperTTS(tts.TTS):
         - en_GB-alan-medium: Male British English
 
     Example:
-        >>> from livekit_local_plugins import PiperTTS
+        >>> from local_livekit_plugins import PiperTTS
         >>> from livekit.agents import AgentSession
         >>>
         >>> tts = PiperTTS(

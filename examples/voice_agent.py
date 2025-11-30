@@ -50,7 +50,7 @@ from livekit.plugins import silero
 from livekit.plugins import openai as lk_openai
 
 # Local plugins
-from livekit_local_plugins import FasterWhisperSTT, PiperTTS
+from local_livekit_plugins import FasterWhisperSTT, PiperTTS
 
 # Configure logging
 logging.basicConfig(

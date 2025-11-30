@@ -1,5 +1,5 @@
 [project]
-name = "livekit-local-plugins"
+name = "local-livekit-plugins"
 version = "0.1.0"
 description = "Local STT and TTS plugins for LiveKit Agents - no cloud APIs required"
 readme = "README.md"
@@ -46,17 +46,17 @@ cloud = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/CoreWorxLab/livekit-local-plugins"
-Repository = "https://github.com/CoreWorxLab/livekit-local-plugins"
-Issues = "https://github.com/CoreWorxLab/livekit-local-plugins/issues"
-Documentation = "https://github.com/CoreWorxLab/livekit-local-plugins#readme"
+Homepage = "https://github.com/CoreWorxLab/local-livekit-plugins"
+Repository = "https://github.com/CoreWorxLab/local-livekit-plugins"
+Issues = "https://github.com/CoreWorxLab/local-livekit-plugins/issues"
+Documentation = "https://github.com/CoreWorxLab/local-livekit-plugins#readme"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/livekit_local_plugins"]
+packages = ["src/local_livekit_plugins"]
 
 [dependency-groups]
 dev = [

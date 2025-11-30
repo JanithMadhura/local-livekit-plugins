@@ -10,12 +10,12 @@ Plugins:
     PiperTTS: Fast local text-to-speech using Piper
 
 Example:
-    >>> from livekit_local_plugins import FasterWhisperSTT, PiperTTS
+    >>> from local_livekit_plugins import FasterWhisperSTT, PiperTTS
     >>>
     >>> stt = FasterWhisperSTT(model_size="medium", device="cuda")
     >>> tts = PiperTTS(model_path="/path/to/voice.onnx")
 
-Repository: https://github.com/CoreWorxLab/livekit-local-plugins
+Repository: https://github.com/CoreWorxLab/local-livekit-plugins
 License: MIT
 """
 

@@ -6,7 +6,7 @@ LiveKit Local Plugins - Custom STT and TTS plugins for LiveKit Agents that run e
 
 ## Architecture
 
-- `src/livekit_local_plugins/` - The installable Python package
+- `src/local_livekit_plugins/` - The installable Python package
   - `faster_whisper_stt.py` - STT plugin using faster-whisper (GPU-accelerated)
   - `piper_tts.py` - TTS plugin using Piper
 - `examples/` - Demo code showing how to use the plugins (not part of installed package)

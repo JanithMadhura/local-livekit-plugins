@@ -16,7 +16,7 @@ Requirements:
     - CUDA toolkit (optional, for GPU acceleration)
 
 Example:
-    >>> from livekit_local_plugins import FasterWhisperSTT
+    >>> from local_livekit_plugins import FasterWhisperSTT
     >>>
     >>> # GPU-accelerated (recommended)
     >>> stt = FasterWhisperSTT(model_size="medium", device="cuda")
@@ -74,7 +74,7 @@ class FasterWhisperSTT(stt.STT):
         - Latency varies by model size, hardware, and audio length
 
     Example:
-        >>> from livekit_local_plugins import FasterWhisperSTT
+        >>> from local_livekit_plugins import FasterWhisperSTT
         >>> from livekit.agents import AgentSession
         >>>
         >>> stt = FasterWhisperSTT(
