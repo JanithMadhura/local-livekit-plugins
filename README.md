@@ -61,8 +61,8 @@ Custom plugins for [LiveKit Agents](https://docs.livekit.io/agents/) that enable
 ### 1. Clone and Install
 
 ```bash
-git clone https://github.com/CoreWorxLab/livekit-local-plugins.git
-cd livekit-local-plugins
+git clone https://github.com/CoreWorxLab/local-livekit-plugins.git
+cd local-livekit-plugins
 
 # Install with uv (recommended)
 uv sync
@@ -114,13 +114,13 @@ uv run examples/voice_agent.py dev
 ### Install from GitHub
 
 ```bash
-uv add git+https://github.com/CoreWorxLab/livekit-local-plugins.git
+uv add git+https://github.com/CoreWorxLab/local-livekit-plugins.git
 ```
 
 ### Use in Your Agent
 
 ```python
-from livekit_local_plugins import FasterWhisperSTT, PiperTTS
+from local_livekit_plugins import FasterWhisperSTT, PiperTTS
 from livekit.agents import AgentSession
 from livekit.plugins import silero, openai as lk_openai
 
@@ -151,16 +151,16 @@ session = AgentSession(
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      Your Application                        │
+│                      Your Application                       │
 ├─────────────────────────────────────────────────────────────┤
-│                    LiveKit Agents SDK                        │
-├──────────────────┬──────────────────┬───────────────────────┤
+│                    LiveKit Agents SDK                       │
+├───────────────────┬──────────────────┬──────────────────────┤
 │  FasterWhisperSTT │      LLM        │      PiperTTS         │
 │  (this package)   │   (Ollama)      │   (this package)      │
-├──────────────────┼──────────────────┼───────────────────────┤
+├───────────────────┼─────────────────┼───────────────────────┤
 │  faster-whisper   │   ollama        │    piper-tts          │
 │     + CUDA        │                 │   + onnxruntime       │
-└──────────────────┴──────────────────┴───────────────────────┘
+└───────────────────┴─────────────────┴───────────────────────┘
 ```
 
 ## Configuration Reference
@@ -191,8 +191,8 @@ session = AgentSession(
 
 ```bash
 # Clone the repo
-git clone https://github.com/CoreWorxLab/livekit-local-plugins.git
-cd livekit-local-plugins
+git clone https://github.com/CoreWorxLab/local-livekit-plugins.git
+cd local-livekit-plugins
 
 # Install with dev dependencies
 uv sync --all-extras
@@ -249,7 +249,7 @@ Tested on RTX 3060 12GB:
 ### Getting Help
 
 **Community Support:** This project is community-supported. For issues:
-- Check [existing GitHub issues](https://github.com/CoreWorxLab/livekit-local-plugins/issues)
+- Check [existing GitHub issues](https://github.com/CoreWorxLab/local-livekit-plugins/issues)
 - Search for similar problems (especially platform-specific)
 - Open a new issue with your system info (OS, GPU, Python version, error logs)
 
