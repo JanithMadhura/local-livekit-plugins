@@ -1148,57 +1148,6 @@ wheels = [
 ]
 
 [[package]]
-name = "livekit-local-plugins"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "faster-whisper" },
-    { name = "livekit-agents", extra = ["silero", "turn-detector"] },
-    { name = "livekit-plugins-openai" },
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "piper-tts" },
-    { name = "python-dotenv" },
-    { name = "torch" },
-]
-
-[package.optional-dependencies]
-cloud = [
-    { name = "livekit-plugins-cartesia" },
-    { name = "livekit-plugins-deepgram" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "faster-whisper", specifier = ">=1.0.0" },
-    { name = "livekit-agents", extras = ["silero", "turn-detector"], specifier = "~=1.2" },
-    { name = "livekit-plugins-cartesia", marker = "extra == 'cloud'", specifier = "~=1.0" },
-    { name = "livekit-plugins-deepgram", marker = "extra == 'cloud'", specifier = "~=1.0" },
-    { name = "livekit-plugins-openai", specifier = "~=1.0" },
-    { name = "numpy", specifier = ">=1.24.0" },
-    { name = "piper-tts", specifier = ">=1.2.0" },
-    { name = "python-dotenv", specifier = ">=1.0.0" },
-    { name = "torch", specifier = ">=2.0.0" },
-]
-provides-extras = ["cloud"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy", specifier = ">=1.0.0" },
-    { name = "pytest", specifier = ">=7.0.0" },
-    { name = "pytest-asyncio", specifier = ">=0.21.0" },
-    { name = "ruff", specifier = ">=0.1.0" },
-]
-
-[[package]]
 name = "livekit-plugins-cartesia"
 version = "1.3.3"
 source = { registry = "https://pypi.org/simple" }
@@ -1280,6 +1229,57 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ca/ce/21822e6d2289cc19327547d81f0a0acb45203bfc8bfa8920ec054ffd582e/livekit_protocol-1.1.0.tar.gz", hash = "sha256:3085f8ae28b86b58c066b37019cb4c6b4df0a9ac52949d36ebbaddf7ef00f483", size = 61550, upload-time = "2025-11-08T07:45:14.899Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e6/f5/56e33f63a24c983142fe60989101f7f3a616e280a16e2a651db59a284125/livekit_protocol-1.1.0-py3-none-any.whl", hash = "sha256:840cf59ed3ba970fdc13fa0e6e205669be265afda2b8dba950a89e9841419e0e", size = 73146, upload-time = "2025-11-08T07:45:13.417Z" },
+]
+
+[[package]]
+name = "local-livekit-plugins"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "faster-whisper" },
+    { name = "livekit-agents", extra = ["silero", "turn-detector"] },
+    { name = "livekit-plugins-openai" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "piper-tts" },
+    { name = "python-dotenv" },
+    { name = "torch" },
+]
+
+[package.optional-dependencies]
+cloud = [
+    { name = "livekit-plugins-cartesia" },
+    { name = "livekit-plugins-deepgram" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "faster-whisper", specifier = ">=1.0.0" },
+    { name = "livekit-agents", extras = ["silero", "turn-detector"], specifier = "~=1.2" },
+    { name = "livekit-plugins-cartesia", marker = "extra == 'cloud'", specifier = "~=1.0" },
+    { name = "livekit-plugins-deepgram", marker = "extra == 'cloud'", specifier = "~=1.0" },
+    { name = "livekit-plugins-openai", specifier = "~=1.0" },
+    { name = "numpy", specifier = ">=1.24.0" },
+    { name = "piper-tts", specifier = ">=1.2.0" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "torch", specifier = ">=2.0.0" },
+]
+provides-extras = ["cloud"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "mypy", specifier = ">=1.0.0" },
+    { name = "pytest", specifier = ">=7.0.0" },
+    { name = "pytest-asyncio", specifier = ">=0.21.0" },
+    { name = "ruff", specifier = ">=0.1.0" },
 ]
 
 [[package]]
