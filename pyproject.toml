@@ -5,7 +5,7 @@ description = "Local STT and TTS plugins for LiveKit Agents - no cloud APIs requ
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
-    {name = "Corey MacPherson", email = "corey@coreymac.me"}
+    {name = "CoreWorxLab", email = "cmac@coreworxlab.com"}
 ]
 requires-python = ">=3.10"
 keywords = [
