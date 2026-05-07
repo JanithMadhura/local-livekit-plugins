@@ -109,6 +109,30 @@ USE_LOCAL=false uv run examples/voice_agent.py console
 uv run examples/voice_agent.py dev
 ```
 
+## ⚡ Low-Latency Voice Agents
+
+Getting **3x faster responses** with streaming TTS? Read [LATENCY_OPTIMIZATION.md](LATENCY_OPTIMIZATION.md)
+
+If you're seeing 6-7 second round-trip latency, use the optimized agent:
+
+```bash
+# Standard latency: 6-7 seconds
+uv run examples/voice_agent.py console
+
+# Optimized latency: 1.5-3 seconds (60% improvement!)
+uv run examples/voice_agent_optimized.py console
+```
+
+**Optimizations included:**
+- **Streaming TTS**: Audio plays while still generating (200-400ms first audio)
+- **Pipelined LLM**: Start TTS while LLM is outputting
+- **Faster models**: Smaller Whisper model, faster LLM configuration
+- **Speed boost**: 1.5x speech rate (sounds responsive, still clear)
+
+See [LATENCY_OPTIMIZATION.md](LATENCY_OPTIMIZATION.md) for detailed configuration and benchmarking.
+
+---
+
 ## Using the Plugins in Your Own Project
 
 ### Install from GitHub
@@ -120,7 +144,7 @@ uv add git+https://github.com/CoreWorxLab/local-livekit-plugins.git
 ### Use in Your Agent
 
 ```python
-from local_livekit_plugins import FasterWhisperSTT, PiperTTS
+from local_livekit_plugins import FasterWhisperSTT, PiperTTS, PiperTTSStreaming
 from livekit.agents import AgentSession
 from livekit.plugins import silero, openai as lk_openai
 
@@ -131,11 +155,19 @@ stt = FasterWhisperSTT(
     compute_type="float16",   # float16, int8
 )
 
-# Create local TTS
+# Create local TTS - Standard (buffered)
 tts = PiperTTS(
     model_path="/path/to/en_US-ryan-high.onnx",
     use_cuda=False,           # CPU recommended for compatibility
     speed=1.0,
+)
+
+# OR - Create streaming TTS for low-latency (RECOMMENDED)
+tts = PiperTTSStreaming(
+    model_path="/path/to/en_US-ryan-high.onnx",
+    use_cuda=False,
+    speed=1.5,                # 50% faster speech (recommended)
+    streaming=True,           # Enable streaming
 )
 
 # Create session with local LLM (Ollama)
@@ -183,6 +215,18 @@ session = AgentSession(
 | `model_path` | str | required | Path to .onnx voice model |
 | `use_cuda` | bool | False | Enable GPU (has CUDA version constraints) |
 | `speed` | float | 1.0 | Speech rate (0.5-2.0) |
+| `volume` | float | 1.0 | Volume level |
+| `noise_scale` | float | 0.667 | Phoneme variation |
+| `noise_w` | float | 0.8 | Phoneme width variation |
+
+### PiperTTSStreaming (Low-Latency)
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model_path` | str | required | Path to .onnx voice model |
+| `use_cuda` | bool | False | Enable GPU (has CUDA version constraints) |
+| `speed` | float | 1.0 | Speech rate (1.5 recommended for low-latency) |
+| `streaming` | bool | True | Enable streaming mode (for real-time synthesis) |
 | `volume` | float | 1.0 | Volume level |
 | `noise_scale` | float | 0.667 | Phoneme variation |
 | `noise_w` | float | 0.8 | Phoneme width variation |

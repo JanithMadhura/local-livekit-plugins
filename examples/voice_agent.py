@@ -1,31 +1,4 @@
 #!/usr/bin/env python3
-"""
-Local Voice Agent Example
-=========================
-
-A complete example showing how to use the local STT/TTS plugins
-with LiveKit Agents. Supports both cloud and local pipelines.
-
-Usage:
-    # Start with local pipeline
-    USE_LOCAL=true python voice_agent.py dev
-
-    # Start with cloud pipeline (requires API keys)
-    python voice_agent.py dev
-
-Environment Variables:
-    USE_LOCAL           - Set to "true" for local pipeline
-    WHISPER_MODEL       - FasterWhisper model size (default: "medium")
-    WHISPER_DEVICE      - "cuda" or "cpu" (default: "cuda")
-    PIPER_MODEL_PATH    - Path to Piper .onnx model
-    OLLAMA_MODEL        - Ollama model name (default: "llama3.1:8b")
-    OLLAMA_BASE_URL     - Ollama API URL (default: "http://localhost:11434/v1")
-
-For cloud pipeline:
-    DEEPGRAM_API_KEY    - Deepgram API key
-    OPENAI_API_KEY      - OpenAI API key
-    CARTESIA_API_KEY    - Cartesia API key
-"""
 
 from __future__ import annotations
 
@@ -48,6 +21,7 @@ from livekit import agents
 from livekit.agents import AgentSession, Agent, RoomInputOptions
 from livekit.plugins import silero
 from livekit.plugins import openai as lk_openai
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 # Local plugins
 from local_livekit_plugins import FasterWhisperSTT, PiperTTS
@@ -70,8 +44,9 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "")
 PIPER_USE_CUDA = os.getenv("PIPER_USE_CUDA", "false").lower() == "true"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+
 
 
 # =============================================================================
@@ -94,14 +69,7 @@ class VoiceAssistant(Agent):
 # =============================================================================
 
 def create_local_session() -> AgentSession:
-    """
-    Create an AgentSession using fully local STT/LLM/TTS.
 
-    Requirements:
-        - Ollama running with desired model
-        - Piper voice model downloaded
-        - CUDA toolkit (optional, for GPU acceleration)
-    """
     logger.info("=" * 60)
     logger.info("STARTING LOCAL PIPELINE")
     logger.info("=" * 60)
@@ -109,6 +77,8 @@ def create_local_session() -> AgentSession:
     logger.info(f"  LLM: Ollama ({OLLAMA_MODEL})")
     logger.info(f"  TTS: Piper (CUDA: {PIPER_USE_CUDA})")
     logger.info("=" * 60)
+
+    turn_detector = MultilingualModel()
 
     if not PIPER_MODEL_PATH:
         raise ValueError(
@@ -120,7 +90,9 @@ def create_local_session() -> AgentSession:
         stt=FasterWhisperSTT(
             model_size=WHISPER_MODEL,
             device=WHISPER_DEVICE,
-            compute_type="float16" if WHISPER_DEVICE == "cuda" else "int8",
+            compute_type="int8"  #float16
+                if WHISPER_DEVICE == "cpu" 
+                else "int8",
         ),
         llm=lk_openai.LLM.with_ollama(
             model=OLLAMA_MODEL,
@@ -131,10 +103,11 @@ def create_local_session() -> AgentSession:
             use_cuda=PIPER_USE_CUDA,
         ),
         vad=silero.VAD.load(),
+        turn_detection=turn_detector,
     )
 
-
-def create_cloud_session() -> AgentSession:
+''' if cloud pipline is needed'''
+'''def create_cloud_session() -> AgentSession:
     """
     Create an AgentSession using cloud STT/LLM/TTS services.
 
@@ -156,7 +129,7 @@ def create_cloud_session() -> AgentSession:
         llm="openai/gpt-4o-mini",
         tts="cartesia/sonic",
         vad=silero.VAD.load(),
-    )
+    )'''
 
 
 # =============================================================================
@@ -167,7 +140,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     """Main entrypoint for the voice agent."""
 
     logger.info(f"Joining room: {ctx.room.name}")
-    await ctx.connect()
+    await ctx.connect()   #connect agent to LiveKit server and room
 
     # Create session based on configuration
     session = create_local_session() if USE_LOCAL else create_cloud_session()

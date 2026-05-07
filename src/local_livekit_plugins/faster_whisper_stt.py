@@ -91,9 +91,9 @@ class FasterWhisperSTT(stt.STT):
         self,
         model_size: ModelSize = "medium",
         device: Device = "cuda",
-        compute_type: ComputeType = "float16",
+        compute_type: ComputeType = "int8", #float16 for GPU, int8 for CPU
         language: str = "en",
-        beam_size: int = 5,
+        beam_size: int = 1,
         vad_filter: bool = True,
     ) -> None:
         super().__init__(

@@ -45,12 +45,6 @@ cloud = [
     "livekit-plugins-cartesia~=1.0",
 ]
 
-[project.urls]
-Homepage = "https://github.com/CoreWorxLab/local-livekit-plugins"
-Repository = "https://github.com/CoreWorxLab/local-livekit-plugins"
-Issues = "https://github.com/CoreWorxLab/local-livekit-plugins/issues"
-Documentation = "https://github.com/CoreWorxLab/local-livekit-plugins#readme"
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
