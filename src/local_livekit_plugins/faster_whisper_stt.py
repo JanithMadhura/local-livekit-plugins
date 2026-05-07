@@ -29,13 +29,17 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Literal
+from typing import Literal, TYPE_CHECKING
 
 import numpy as np
 from faster_whisper import WhisperModel
 
 from livekit.agents import stt, APIConnectOptions, utils
+from livekit.agents.stt.stream_adapter import StreamAdapter
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
+
+if TYPE_CHECKING:
+    from livekit.plugins.silero.vad import VAD as SileroVAD
 
 __all__ = ["FasterWhisperSTT"]
 
@@ -95,17 +99,22 @@ class FasterWhisperSTT(stt.STT):
         language: str = "en",
         beam_size: int = 1,
         vad_filter: bool = True,
+        streaming: bool = False,
+        vad: "SileroVAD | None" = None,
     ) -> None:
         super().__init__(
             capabilities=stt.STTCapabilities(
-                streaming=False,
-                interim_results=False
+                streaming=streaming,
+                interim_results=False,
             )
         )
 
         self._language = language
         self._beam_size = beam_size
         self._vad_filter = vad_filter
+        self._streaming = streaming
+        self._vad = vad
+        self._model_size = model_size
 
         logger.info(f"Loading FasterWhisper model: {model_size} on {device} ({compute_type})")
 
@@ -172,3 +181,29 @@ class FasterWhisperSTT(stt.STT):
                 language=lang or ""
             )],
         )
+
+    @property
+    def model(self) -> str:
+        return self._model_size
+
+    @property
+    def provider(self) -> str:
+        return "faster-whisper"
+
+    def stream(
+        self,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions = APIConnectOptions(),
+    ) -> stt.RecognizeStream:
+        if not self._streaming:
+            raise NotImplementedError(
+                "streaming is not enabled for this FasterWhisperSTT instance"
+            )
+
+        if self._vad is None:
+            from livekit.plugins.silero import VAD as SileroVAD
+            self._vad = SileroVAD.load()
+
+        adapter = StreamAdapter(stt=self, vad=self._vad)
+        return adapter.stream(language=language, conn_options=conn_options)

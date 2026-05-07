@@ -119,6 +119,7 @@ def create_optimized_local_session() -> AgentSession:
     logger.info("=" * 70)
 
     turn_detector = MultilingualModel()
+    stt_vad = silero.VAD.load()
 
     if not PIPER_MODEL_PATH:
         raise ValueError(
@@ -127,11 +128,13 @@ def create_optimized_local_session() -> AgentSession:
         )
 
     return AgentSession(
-        # STT: Smaller model for faster transcription
+        # STT: Streaming-capable whisper with VAD-based chunking
         stt=FasterWhisperSTT(
             model_size=WHISPER_MODEL,
             device=WHISPER_DEVICE,
             compute_type=WHISPER_COMPUTE_TYPE,  # Quantized for speed
+            streaming=True,
+            vad=stt_vad,
         ),
         # LLM: Streaming is automatic with LiveKit agents
         llm=lk_openai.LLM.with_ollama(
@@ -146,7 +149,7 @@ def create_optimized_local_session() -> AgentSession:
             speed=PIPER_SPEED,  # 1.5 = 50% faster
             streaming=False,    # Uses internal sentence-level streaming (compatible)
         ),
-        vad=silero.VAD.load(),
+        vad=stt_vad,
         turn_detection=turn_detector,
     )
 
