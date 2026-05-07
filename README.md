@@ -109,6 +109,61 @@ USE_LOCAL=false uv run examples/voice_agent.py console
 uv run examples/voice_agent.py dev
 ```
 
+## 🐳 Docker - Run on Any Computer
+
+Get the entire stack (LiveKit, LLM, Voice Agent) running with one command:
+
+```bash
+# Pull all images and start services
+docker compose -f docker-compose.prod.yaml up -d
+
+# Check service status
+docker compose -f docker-compose.prod.yaml ps
+
+# View logs
+docker compose -f docker-compose.prod.yaml logs -f voice-agent
+
+# Stop all services
+docker compose -f docker-compose.prod.yaml down
+```
+
+### Docker Setup Details
+
+**What's included:**
+- **livekit-server**: WebRTC media server (localhost:7880)
+- **ollama**: Local LLM inference (localhost:11434)
+- **voice-agent**: Voice AI with streaming STT + TTS
+
+**First run:**
+The image builds automatically. First pull takes 5-10 minutes (Python, dependencies). On first run, Ollama will download the LLM model (~7GB for neural-chat, ~4GB for tinyllama).
+
+```bash
+# Pre-download model to avoid delays:
+docker compose -f docker-compose.prod.yaml exec ollama ollama pull neural-chat
+
+# Then start the agent
+docker compose -f docker-compose.prod.yaml restart voice-agent
+```
+
+**GPU Support:**
+Uncomment the `CUDA_VISIBLE_DEVICES` line in `docker-compose.prod.yaml` to enable GPU:
+```yaml
+environment:
+  CUDA_VISIBLE_DEVICES: "0"  # GPU device ID
+```
+
+**Custom Configuration:**
+Edit environment variables in `docker-compose.prod.yaml`:
+```yaml
+voice-agent:
+  environment:
+    WHISPER_MODEL: "base"          # Model size: tiny, base, small, medium
+    WHISPER_DEVICE: "cuda"         # cuda or cpu
+    PIPER_SPEED: "1.5"             # Speech rate multiplier
+    OLLAMA_MODEL: "neural-chat"    # LLM model
+```
+
+---
 ## ⚡ Low-Latency Voice Agents
 
 Getting **3x faster responses** with streaming TTS? Read [LATENCY_OPTIMIZATION.md](LATENCY_OPTIMIZATION.md)

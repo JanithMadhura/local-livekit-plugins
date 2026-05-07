@@ -1,0 +1,87 @@
+# Docker Compose Configuration
+# Complete voice agent stack with LiveKit server, voice agent, and Ollama LLM
+
+version: '3.8'
+
+services:
+  # LiveKit Server - WebRTC media server
+  livekit-server:
+    image: livekit/livekit-server:latest
+    container_name: livekit-server
+    network_mode: host  # Required for WebRTC - avoids NAT issues
+    command: --dev --bind 0.0.0.0
+    environment:
+      LIVEKIT_LOG_LEVEL: info
+      # Dev credentials: API Key = devkey, Secret = secret
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7880/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Ollama - Local LLM inference engine
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama-server
+    ports:
+      - "11434:11434"
+    environment:
+      # Optional: Set to GPU device ID if using NVIDIA GPU
+      # CUDA_VISIBLE_DEVICES: "0"
+      OLLAMA_HOST: "0.0.0.0:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    # Uncomment below to pull a model on startup (slow on first run)
+    # command: ollama pull neural-chat
+
+  # Voice Agent - Local speech processing with streaming TTS/STT
+  voice-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voice-agent
+    depends_on:
+      livekit-server:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    network_mode: host  # Required to reach livekit-server on localhost
+    environment:
+      OLLAMA_BASE_URL: "http://localhost:11434/v1"
+      WHISPER_MODEL: "base"
+      WHISPER_DEVICE: "cuda"
+      WHISPER_COMPUTE_TYPE: "float16"
+      PIPER_SPEED: "1.5"
+      PIPER_USE_CUDA: "false"
+      OLLAMA_MODEL: "neural-chat"
+      USE_LOCAL: "true"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./models:/app/models:ro
+      - ./examples/.env.local:/app/examples/.env.local:ro
+    stdin_open: true
+    tty: true
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "python", "-c", "print('healthy')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  ollama_data:
+    driver: local
+
+# Network notes:
+# - host network mode required for WebRTC (NAT traversal)
+# - All services communicate via localhost:port
+# - Modify ports and networks if running in production/multi-host setup
