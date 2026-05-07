@@ -97,7 +97,10 @@ class OptimizedVoiceAssistant(Agent):
             - Respond in ONE SHORT sentence.
             - Maximum 5 words.
             - Be concise and direct.
-            - Never give long explanations unless explicitly requested."""
+            - Never give long explanations unless explicitly requested.
+            - Stop immediately after answering.
+            - Never continue speaking.
+            - Never generate follow-up explanations."""
         )
 
 
@@ -189,9 +192,13 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         if ev.new_state == "speaking" and _transcription_time is not None:
             _first_audio_time = time.perf_counter()
             latency_ms = (_first_audio_time - _transcription_time) * 1000
-            logger.info(f"⚡ FIRST AUDIO LATENCY: {latency_ms:.0f}ms (streaming benefit!)")
+            logger.info(f"AUDIO LATENCY: {latency_ms:.0f}ms")
             _transcription_time = None
 
+    @session.on("agent_state_changed")
+    def on_state_change(ev):
+        if ev.new_state == "speaking":
+            print("TTS started - LLM streaming is working!")
     # =========================================================================
 
     # Start the agent session
