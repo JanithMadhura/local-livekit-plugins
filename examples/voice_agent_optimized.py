@@ -25,6 +25,7 @@ import logging
 import os
 import sys
 import time
+import asyncio
 
 # Add parent directory to path for local development
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -71,7 +72,7 @@ PIPER_SPEED = float(os.getenv("PIPER_SPEED", "1.0"))  # 50% faster speech
 PIPER_USE_CUDA = os.getenv("PIPER_USE_CUDA", "false").lower() == "true"
 
 # LLM: Use faster model if available
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "neural-chat")  # phi3, neural-chat, tinyllama
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3")  # phi3, neural-chat, tinyllama
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 
 
@@ -91,16 +92,19 @@ class OptimizedVoiceAssistant(Agent):
 
     def __init__(self) -> None:
         super().__init__(
-            instructions="""You are a realtime voice assistant.
+            instructions="""
+                You are a realtime voice assistant.
 
-            Rules:
-            - Respond in ONE SHORT sentence.
-            - Maximum 5 words.
-            - Be concise and direct.
-            - Never give long explanations unless explicitly requested.
-            - Stop immediately after answering.
-            - Never continue speaking.
-            - Never generate follow-up explanations."""
+                STRICT RULES:
+                - Maximum 5 words
+                - One sentence only
+                - No explanations
+                - No repetition
+                - No extra details
+                - No safety messages
+                - Stop immediately after answering
+                """
+
         )
 
 
@@ -122,7 +126,12 @@ def create_optimized_local_session() -> AgentSession:
     logger.info("=" * 70)
 
     turn_detector = MultilingualModel()
-    stt_vad = silero.VAD.load()
+    stt_vad = silero.VAD.load(
+        min_speech_duration=0.1,
+        min_silence_duration=0.2,
+        prefix_padding_duration=0.1,
+        max_buffered_speech=1.5,
+    )
 
     if not PIPER_MODEL_PATH:
         raise ValueError(
@@ -143,7 +152,8 @@ def create_optimized_local_session() -> AgentSession:
         llm=lk_openai.LLM.with_ollama(
             model=OLLAMA_MODEL,
             base_url=OLLAMA_BASE_URL,
-        ),
+            temperature=0.1,
+        ), 
         # TTS: Uses internal sentence-level streaming for low-latency synthesis
         # (not LiveKit's streaming interface, but achieves same effect)
         tts=PiperTTSStreaming(
@@ -178,28 +188,226 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     _chunk_count = 0
     _first_audio_time: float | None = None
 
+    # Transcript stabilization state
+    _partial_transcript = ""
+    _last_speech_time = 0.0
+    _user_speaking = False
+    _eou_probability = 0.0
+    _agent_speaking = False
+    _current_speech_handle = None
+    _interrupt_requested = False
+
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(ev) -> None:
-        nonlocal _transcription_time, _chunk_count, _first_audio_time
+        nonlocal _transcription_time
+        nonlocal _chunk_count
+        nonlocal _first_audio_time
+        nonlocal _partial_transcript
+
         _transcription_time = time.perf_counter()
         _chunk_count = 0
         _first_audio_time = None
-        logger.debug(f"User: {ev.transcript[:80]}...")
+
+        text = ev.transcript.strip()
+
+        if text:
+            # Merge partial transcript progressively
+            _partial_transcript = text
+
+        logger.info(f"PARTIAL: {_partial_transcript}")
+
+    @session.on("user_started_speaking")
+    def on_user_started_speaking():
+        nonlocal _user_speaking
+        nonlocal _agent_speaking
+        nonlocal _partial_transcript
+        nonlocal _current_speech_handle
+        nonlocal _interrupt_requested
+        logger.info(f"Agent speaking state: {_agent_speaking}")
+
+        _user_speaking = True
+
+        # User interrupted assistant speech
+        if _agent_speaking:
+            
+            logger.info("User interruption detected")
+
+            _interrupt_requested = True
+
+            # Clear previous transcript state
+            _partial_transcript = ""
+
+            # Stop assistant speaking state
+            _agent_speaking = False
+
+            # Cancel current speech
+            if _current_speech_handle:
+                try:
+                    _current_speech_handle.cancel()
+                    logger.info("Current speech cancelled")
+                except Exception as e:
+                    logger.warning(f"Speech cancel failed: {e}")
+
+            logger.debug("User started speaking")
+
+    @session.on("user_stopped_speaking")
+    def on_user_stopped_speaking():
+        nonlocal _user_speaking, _last_speech_time
+        _user_speaking = False
+        _last_speech_time = time.perf_counter()
+        logger.debug("User stopped speaking")
 
     @session.on("agent_state_changed")
     def on_agent_state_changed(ev) -> None:
-        nonlocal _transcription_time, _first_audio_time
-        if ev.new_state == "speaking" and _transcription_time is not None:
-            _first_audio_time = time.perf_counter()
-            latency_ms = (_first_audio_time - _transcription_time) * 1000
-            logger.info(f"AUDIO LATENCY: {latency_ms:.0f}ms")
-            _transcription_time = None
+        nonlocal _transcription_time
+        nonlocal _first_audio_time
+        nonlocal _agent_speaking
+        nonlocal _partial_transcript
+
+        if ev.new_state == "speaking":
+            _agent_speaking = True
+
+            # Reset transcript state when AI starts speaking
+            _partial_transcript = ""
+
+            if _transcription_time is not None:
+                _first_audio_time = time.perf_counter()
+
+                latency_ms = (
+                    _first_audio_time - _transcription_time
+                ) * 1000
+
+                logger.info(
+                    f"AUDIO LATENCY: {latency_ms:.0f}ms"
+                )
+
+                _transcription_time = None
+
+        else:
+            _agent_speaking = False
 
     @session.on("agent_state_changed")
     def on_state_change(ev):
         if ev.new_state == "speaking":
             print("TTS started - LLM streaming is working!")
+
+    async def stream_llm_to_tts(session, user_text):
+        """
+        Stream Ollama tokens directly into TTS sentence-by-sentence.
+        """
+        generated_chars = 0
+
+        nonlocal _agent_speaking
+        nonlocal _interrupt_requested
+
+        logger.info(f"Streaming response for: {user_text}")
+
+        stream = await session.llm.chat(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a realtime voice assistant. "
+                        "Maximum 1 short sentence. "
+                        "Maximum 10 words."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": user_text,
+                },
+            ],
+            stream=True,
+        )
+
+        current_sentence = ""
+
+        async for chunk in stream:
+
+            # interruption support
+            if _interrupt_requested:
+                logger.info("LLM stream interrupted")
+                break
+
+            token = chunk.delta.content or ""
+
+            generated_chars += len(token)
+
+            # hard cutoff
+            if generated_chars > 40:
+                logger.info("Generation cutoff reached")
+                break
+
+            if not token:
+                continue
+
+            current_sentence += token
+
+            logger.info(f"TOKEN: {token}")
+
+            # sentence boundary detection
+            words = current_sentence.split()
+
+            should_emit = (
+                len(words) >= 4
+                or any(p in token for p in [".", "!", "?"])
+            )
+
+            if should_emit:
+
+                chunk_text = current_sentence.strip()
+
+                if chunk_text:
+
+                    logger.info(f"TTS CHUNK: {chunk_text}")
+
+                    _agent_speaking = True
+                    chunk_text = chunk_text[:50]
+                    asyncio.create_task(session.say(chunk_text))
+
+                current_sentence = ""
+
+        # leftover partial sentence
+        if current_sentence.strip() and not _interrupt_requested:
+            await session.say(current_sentence.strip())
+
+        _agent_speaking = False
     # =========================================================================
+    async def transcript_monitor():
+        nonlocal _partial_transcript
+        nonlocal _user_speaking
+        nonlocal _last_speech_time
+
+        while True:
+            await asyncio.sleep(0.1)
+
+            if not _partial_transcript:
+                continue
+
+            silence_duration = time.perf_counter() - _last_speech_time
+
+            # Finalize only if:
+            # - user stopped speaking
+            # - enough silence passed
+            should_finalize = (
+                not _user_speaking
+                and silence_duration > 1.0
+                and len(_partial_transcript.split()) > 2
+            )
+
+            if should_finalize:
+                final_text = _partial_transcript.strip()
+
+                logger.info(f"FINALIZED: {final_text}")
+
+                _partial_transcript = ""
+
+                nonlocal _current_speech_handle
+                nonlocal _interrupt_requested
+
+                _interrupt_requested = False 
+
+                await stream_llm_to_tts(session, final_text)
 
     # Start the agent session
     await session.start(
@@ -208,10 +416,14 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         room_input_options=RoomInputOptions(),
     )
 
-    # Send optimized greeting
     await session.generate_reply(
-        instructions="Greet the user briefly - just say you're ready!"
+        instructions="Say hello briefly and say you're ready."
     )
+
+    asyncio.create_task(transcript_monitor())
+
+    # Send optimized greeting
+    
 
     logger.info("Agent ready - listening for speech...")
 

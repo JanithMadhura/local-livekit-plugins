@@ -60,7 +60,12 @@ class _PiperStreamingChunkedStream(tts.ChunkedStream):
     ) -> None:
         super().__init__(tts=tts_plugin, input_text=input_text, conn_options=conn_options)
         self._piper_tts = tts_plugin
+        self._interrupted = False
 
+    async def aclose(self) -> None:
+        self._interrupted = True
+        await super().aclose()
+        
     async def _run(self, emitter: AudioEmitter) -> None:
         """Stream audio chunks as sentences are synthesized."""
         emitter.initialize(
@@ -81,6 +86,9 @@ class _PiperStreamingChunkedStream(tts.ChunkedStream):
         # Process sentences in order, stream as they're ready
         loop = asyncio.get_running_loop()
         for sentence in sentences:
+            if self._interrupted:
+                logger.info("TTS interrupted")
+                break
             if not sentence.strip():
                 continue
 
@@ -95,6 +103,9 @@ class _PiperStreamingChunkedStream(tts.ChunkedStream):
 
             # Emit immediately - audio playback can start now
             emitter.push(audio_bytes)
+            if self._interrupted:
+                logger.info("TTS interrupted before playback")
+                break
             chunks_emitted += 1
             logger.debug(
                 f"Streamed sentence {chunks_emitted}: "

@@ -105,7 +105,7 @@ class FasterWhisperSTT(stt.STT):
         super().__init__(
             capabilities=stt.STTCapabilities(
                 streaming=streaming,
-                interim_results=False,
+                interim_results=True,
             )
         )
 
@@ -115,13 +115,20 @@ class FasterWhisperSTT(stt.STT):
         self._streaming = streaming
         self._vad = vad
         self._model_size = model_size
+        self._partial_text = ""
+
+        # Rolling streaming buffer
+        self._rolling_audio = np.array([], dtype=np.float32)
+        self._last_emit_time = 0.0
 
         logger.info(f"Loading FasterWhisper model: {model_size} on {device} ({compute_type})")
 
         self._model = WhisperModel(
             model_size,
             device=device,
-            compute_type=compute_type
+            compute_type=compute_type,
+            cpu_threads=4,
+            num_workers=1,
         )
 
         logger.info(f"FasterWhisper ready - language={language}, beam_size={beam_size}")
@@ -152,10 +159,33 @@ class FasterWhisperSTT(stt.STT):
         # Use provided language or fall back to configured default
         lang = language if language is not NOT_GIVEN else self._language
 
+        # Append incoming audio to rolling buffer
+        self._rolling_audio = np.concatenate([
+            self._rolling_audio,
+            audio_data
+        ])
+
+        # Keep only recent 1 second
+        max_samples = 16000 * 100
+
+        if len(self._rolling_audio) > max_samples:
+            self._rolling_audio = self._rolling_audio[-max_samples:]
+
+        # Throttle inference rate
+        now = time.perf_counter()
+
+        if now - self._last_emit_time < 0.5:
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                alternatives=[],
+            )
+
+        self._last_emit_time = now
+
         # Run transcription with optimized settings
         start_time = time.perf_counter()
         segments, info = self._model.transcribe(
-            audio_data,
+            self._rolling_audio,
             beam_size=self._beam_size,
             best_of=self._beam_size,
             temperature=0.0,  # Greedy decoding for consistency
@@ -163,8 +193,14 @@ class FasterWhisperSTT(stt.STT):
             language=lang,
         )
 
-        # Combine all segments into final text
+        # Combine all segments into text
         text = "".join(segment.text for segment in segments).strip()
+
+        # Rolling partial transcript accumulation
+        # Streaming transcript overwrite
+        if text:
+            self._partial_text = text
+
         elapsed_ms = (time.perf_counter() - start_time) * 1000
 
         if text:
@@ -172,14 +208,37 @@ class FasterWhisperSTT(stt.STT):
 
         logger.debug(f"STT latency: {elapsed_ms:.0f}ms for {info.duration:.1f}s audio")
 
+        # Emit interim transcript during streaming
+        if self._streaming:
+            logger.debug(f"INTERIM: {self._partial_text}")
+
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                alternatives=[
+                    stt.SpeechData(
+                        text=self._partial_text,
+                        start_time=0,
+                        end_time=0,
+                        language=lang or ""
+                    )
+                ],
+            )
+        final_text = self._partial_text.strip()
+
+        logger.debug(f"FINAL: {final_text}")
+
+        self._partial_text = ""
+
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-            alternatives=[stt.SpeechData(
-                text=text,
-                start_time=0,
-                end_time=0,
-                language=lang or ""
-            )],
+            alternatives=[
+                stt.SpeechData(
+                    text=final_text,
+                    start_time=0,
+                    end_time=0,
+                    language=lang or ""
+                )
+            ],
         )
 
     @property
