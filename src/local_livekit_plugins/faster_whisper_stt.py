@@ -166,7 +166,7 @@ class FasterWhisperSTT(stt.STT):
         ])
 
         # Keep only recent 1 second
-        max_samples = 16000 * 100
+        max_samples = 16000 * 5
 
         if len(self._rolling_audio) > max_samples:
             self._rolling_audio = self._rolling_audio[-max_samples:]

@@ -21,8 +21,9 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY src/ src/
 COPY examples/ examples/
-COPY models/ models/ 2>/dev/null || true
+COPY models/ models/
 
+COPY README.md ./
 # Install dependencies with uv
 RUN uv sync --frozen --no-dev
 
@@ -45,8 +46,8 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY src/ src/
 COPY examples/ examples/
-COPY models/ models/ 2>/dev/null || true
-COPY .env.local examples/.env.local 2>/dev/null || true
+COPY models/ models/
+COPY examples/.env.local examples/.env.local
 
 # Set environment variables
 ENV PATH="/app/.venv/bin:$PATH" \

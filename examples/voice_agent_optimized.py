@@ -32,6 +32,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from dotenv import load_dotenv
 
+from livekit.agents.llm import ChatContext
+
 # Load environment variables
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_script_dir, ".env.local"))
@@ -296,29 +298,44 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         Stream Ollama tokens directly into TTS sentence-by-sentence.
         """
         generated_chars = 0
+        tts_queue = asyncio.Queue()
 
         nonlocal _agent_speaking
         nonlocal _interrupt_requested
 
         logger.info(f"Streaming response for: {user_text}")
 
-        stream = await session.llm.chat(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a realtime voice assistant. "
-                        "Maximum 1 short sentence. "
-                        "Maximum 10 words."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": user_text,
-                },
-            ],
-            stream=True,
+        async def tts_worker():
+
+            while True:
+
+                chunk = await tts_queue.get()
+
+                if chunk is None:
+                    break
+
+                try:
+                    await session.say(chunk)
+                except Exception as e:
+                    logger.warning(f"TTS worker error: {e}")
+
+                tts_queue.task_done()
+
+        # Start TTS worker
+        worker_task = asyncio.create_task(tts_worker())
+
+        ctx = ChatContext()
+        ctx.append(
+            role="system",
+            text="Reply under 5 words."
         )
+
+        ctx.append(
+            role="user",
+            text=user_text
+        )
+
+        stream = session.llm.chat(chat_ctx=ctx)
 
         current_sentence = ""
 
@@ -334,7 +351,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             generated_chars += len(token)
 
             # hard cutoff
-            if generated_chars > 40:
+            if generated_chars > 20:
                 logger.info("Generation cutoff reached")
                 break
 
@@ -343,13 +360,29 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
             current_sentence += token
 
-            logger.info(f"TOKEN: {token}")
+            # FORCE ultra-fast streaming
+            if len(current_sentence.strip()) >= 8:
 
-            # sentence boundary detection
+                chunk_text = current_sentence.strip()
+
+                logger.info(f"EARLY TTS: {chunk_text}")
+
+                _agent_speaking = True
+
+                await tts_queue.put(chunk_text)
+
+                current_sentence = ""
+                
+            '''if len(current_sentence) > 30:
+                should_emit = True
+
+            logger.info(f"TOKEN: {token}") '''
+
+            '''# sentence boundary detection
             words = current_sentence.split()
 
             should_emit = (
-                len(words) >= 4
+                len(current_sentence) > 8
                 or any(p in token for p in [".", "!", "?"])
             )
 
@@ -363,14 +396,26 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
                     _agent_speaking = True
                     chunk_text = chunk_text[:50]
-                    asyncio.create_task(session.say(chunk_text))
+                    await tts_queue.put(chunk_text)
+                    
 
-                current_sentence = ""
+                current_sentence = "" '''
 
         # leftover partial sentence
-        if current_sentence.strip() and not _interrupt_requested:
-            await session.say(current_sentence.strip())
+        if (
+            len(current_sentence.strip()) > 3
+            and not _interrupt_requested
+        ):
+            await tts_queue.put(current_sentence.strip())
 
+        # Keep only recent conversation turns
+        if hasattr(session, "_chat_ctx"):
+            session._chat_ctx.messages = session._chat_ctx.messages[-2:]
+
+        await tts_queue.put(None)
+
+        await worker_task
+        
         _agent_speaking = False
     # =========================================================================
     async def transcript_monitor():
@@ -416,9 +461,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         room_input_options=RoomInputOptions(),
     )
 
-    await session.generate_reply(
-        instructions="Say hello briefly and say you're ready."
-    )
+    await session.say("Hello, ready.")
 
     asyncio.create_task(transcript_monitor())
 
