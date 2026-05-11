@@ -27,8 +27,10 @@ Example:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Literal, TYPE_CHECKING
 
 import numpy as np
@@ -101,6 +103,8 @@ class FasterWhisperSTT(stt.STT):
         vad_filter: bool = True,
         streaming: bool = False,
         vad: "SileroVAD | None" = None,
+        max_audio_seconds: float = 2.0,
+        min_inference_interval: float = 0.0,
     ) -> None:
         super().__init__(
             capabilities=stt.STTCapabilities(
@@ -116,9 +120,16 @@ class FasterWhisperSTT(stt.STT):
         self._vad = vad
         self._model_size = model_size
         self._partial_text = ""
+        self._max_audio_seconds = max_audio_seconds
+        self._min_inference_interval = min_inference_interval
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="faster-whisper-stt",
+        )
 
-        # Rolling streaming buffer
-        self._rolling_audio = np.array([], dtype=np.float32)
+        # VAD controls speech segmentation; avoid repeatedly transcribing a
+        # growing rolling buffer because that makes latency scale with silence
+        # and previous turns.
         self._last_emit_time = 0.0
 
         logger.info(f"Loading FasterWhisper model: {model_size} on {device} ({compute_type})")
@@ -159,22 +170,24 @@ class FasterWhisperSTT(stt.STT):
         # Use provided language or fall back to configured default
         lang = language if language is not NOT_GIVEN else self._language
 
-        # Append incoming audio to rolling buffer
-        self._rolling_audio = np.concatenate([
-            self._rolling_audio,
-            audio_data
-        ])
+        if self._max_audio_seconds > 0:
+            max_samples = int(16000 * self._max_audio_seconds)
 
-        # Keep only recent 1 second
-        max_samples = 16000 * 5
-
-        if len(self._rolling_audio) > max_samples:
-            self._rolling_audio = self._rolling_audio[-max_samples:]
+            if len(audio_data) > max_samples:
+                logger.debug(
+                    "Trimming STT audio from %.1fs to %.1fs",
+                    len(audio_data) / 16000,
+                    self._max_audio_seconds,
+                )
+                audio_data = audio_data[-max_samples:]
 
         # Throttle inference rate
         now = time.perf_counter()
 
-        if now - self._last_emit_time < 0.5:
+        if (
+            self._min_inference_interval > 0
+            and now - self._last_emit_time < self._min_inference_interval
+        ):
             return stt.SpeechEvent(
                 type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
                 alternatives=[],
@@ -182,19 +195,15 @@ class FasterWhisperSTT(stt.STT):
 
         self._last_emit_time = now
 
-        # Run transcription with optimized settings
+        # Run synchronous Whisper inference off the async event loop.
         start_time = time.perf_counter()
-        segments, info = self._model.transcribe(
-            self._rolling_audio,
-            beam_size=self._beam_size,
-            best_of=self._beam_size,
-            temperature=0.0,  # Greedy decoding for consistency
-            vad_filter=self._vad_filter,
-            language=lang,
+        loop = asyncio.get_running_loop()
+        text, detected_language, duration = await loop.run_in_executor(
+            self._executor,
+            self._transcribe_blocking,
+            audio_data,
+            lang,
         )
-
-        # Combine all segments into text
-        text = "".join(segment.text for segment in segments).strip()
 
         # Rolling partial transcript accumulation
         # Streaming transcript overwrite
@@ -204,9 +213,9 @@ class FasterWhisperSTT(stt.STT):
         elapsed_ms = (time.perf_counter() - start_time) * 1000
 
         if text:
-            logger.debug(f"Transcribed ({info.language}, {info.duration:.1f}s): {text}")
+            logger.debug(f"Transcribed ({detected_language}, {duration:.1f}s): {text}")
 
-        logger.debug(f"STT latency: {elapsed_ms:.0f}ms for {info.duration:.1f}s audio")
+        logger.debug(f"STT latency: {elapsed_ms:.0f}ms for {duration:.1f}s audio")
 
         # Emit interim transcript during streaming
         if self._streaming:
@@ -240,6 +249,21 @@ class FasterWhisperSTT(stt.STT):
                 )
             ],
         )
+
+    def _transcribe_blocking(self, audio_data: np.ndarray, lang: str | None) -> tuple[str, str, float]:
+        segments, info = self._model.transcribe(
+            audio_data,
+            beam_size=self._beam_size,
+            best_of=self._beam_size,
+            temperature=0.0,  # Greedy decoding for consistency
+            vad_filter=self._vad_filter,
+            language=lang,
+            condition_on_previous_text=False,
+            without_timestamps=True,
+        )
+
+        text = "".join(segment.text for segment in segments).strip()
+        return text, info.language, info.duration
 
     @property
     def model(self) -> str:

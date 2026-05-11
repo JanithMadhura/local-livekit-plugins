@@ -40,7 +40,7 @@ load_dotenv(os.path.join(_script_dir, ".env.local"))
 
 # LiveKit imports - plugins must be at module level
 from livekit import agents
-from livekit.agents import AgentSession, Agent, RoomInputOptions
+from livekit.agents import AgentSession, Agent, RoomInputOptions, StopResponse
 from livekit.plugins import silero
 from livekit.plugins import openai as lk_openai
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -64,9 +64,16 @@ logger = logging.getLogger("voice-agent-optimized")
 USE_LOCAL = os.getenv("USE_LOCAL", "true").lower() == "true"
 
 # STT: Use smaller/faster Whisper model
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")  # "base" is faster than "medium"
-WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
-WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # float16 for GPU, int8 for CPU
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny.en")  # tiny.en is fastest for English
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE = os.getenv(
+    "WHISPER_COMPUTE_TYPE",
+    "float16" if WHISPER_DEVICE == "cuda" else "int8",
+)
+WHISPER_MAX_AUDIO_SECONDS = float(os.getenv("WHISPER_MAX_AUDIO_SECONDS", "2.0"))
+WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "false").lower() == "true"
+FINALIZE_SILENCE_SECONDS = float(os.getenv("FINALIZE_SILENCE_SECONDS", "0.6"))
+MIN_FINAL_TRANSCRIPT_CHARS = int(os.getenv("MIN_FINAL_TRANSCRIPT_CHARS", "2"))
 
 # TTS: Streaming with 1.5x speed for lower latency
 PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "")
@@ -74,8 +81,11 @@ PIPER_SPEED = float(os.getenv("PIPER_SPEED", "1.0"))  # 50% faster speech
 PIPER_USE_CUDA = os.getenv("PIPER_USE_CUDA", "false").lower() == "true"
 
 # LLM: Use faster model if available
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3")  # phi3, neural-chat, tinyllama
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:latest")  # use `ollama list` for installed names
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "20"))
+EARLY_TTS_WORDS = max(1, int(os.getenv("EARLY_TTS_WORDS", "3")))
+MAX_TTS_WORDS = max(EARLY_TTS_WORDS, int(os.getenv("MAX_TTS_WORDS", "8")))
 
 
 # =============================================================================
@@ -98,8 +108,10 @@ class OptimizedVoiceAssistant(Agent):
                 You are a realtime voice assistant.
 
                 STRICT RULES:
-                - Maximum 5 words
+                - Maximum 6 words
                 - One sentence only
+                - No apologies
+                - No preamble
                 - No explanations
                 - No repetition
                 - No extra details
@@ -108,6 +120,10 @@ class OptimizedVoiceAssistant(Agent):
                 """
 
         )
+
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        """Stop LiveKit's automatic reply; the manual stream handles TTS."""
+        raise StopResponse()
 
 
 # =============================================================================
@@ -120,8 +136,11 @@ def create_optimized_local_session() -> AgentSession:
     logger.info("=" * 70)
     logger.info("OPTIMIZED LOW-LATENCY PIPELINE")
     logger.info("=" * 70)
-    logger.info(f"  STT: FasterWhisper ({WHISPER_MODEL} on {WHISPER_DEVICE}, {WHISPER_COMPUTE_TYPE})")
-    logger.info(f"  LLM: Ollama ({OLLAMA_MODEL}) - streaming enabled")
+    logger.info(
+        f"  STT: FasterWhisper ({WHISPER_MODEL} on {WHISPER_DEVICE}, "
+        f"{WHISPER_COMPUTE_TYPE}, max_audio={WHISPER_MAX_AUDIO_SECONDS}s)"
+    )
+    logger.info(f"  LLM: Ollama ({OLLAMA_MODEL}) - manual streaming, max_tokens={OLLAMA_MAX_TOKENS}")
     logger.info(f"  TTS: PiperTTSStreaming (speed={PIPER_SPEED}x, streaming=True)")
     logger.info("=" * 70)
     logger.info("Expected latency: 1.5-3 seconds (vs 6-7 seconds standard)")
@@ -147,14 +166,16 @@ def create_optimized_local_session() -> AgentSession:
             model_size=WHISPER_MODEL,
             device=WHISPER_DEVICE,
             compute_type=WHISPER_COMPUTE_TYPE,  # Quantized for speed
+            vad_filter=WHISPER_VAD_FILTER,
             streaming=True,
             vad=stt_vad,
+            max_audio_seconds=WHISPER_MAX_AUDIO_SECONDS,
         ),
         # LLM: Streaming is automatic with LiveKit agents
         llm=lk_openai.LLM.with_ollama(
             model=OLLAMA_MODEL,
             base_url=OLLAMA_BASE_URL,
-            temperature=0.1,
+            temperature=0.0,
         ), 
         # TTS: Uses internal sentence-level streaming for low-latency synthesis
         # (not LiveKit's streaming interface, but achieves same effect)
@@ -245,7 +266,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             # Cancel current speech
             if _current_speech_handle:
                 try:
-                    _current_speech_handle.cancel()
+                    _current_speech_handle.interrupt(force=True)
                     logger.info("Current speech cancelled")
                 except Exception as e:
                     logger.warning(f"Speech cancel failed: {e}")
@@ -298,14 +319,17 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         Stream Ollama tokens directly into TTS sentence-by-sentence.
         """
         generated_chars = 0
+        emitted_words = 0
         tts_queue = asyncio.Queue()
 
         nonlocal _agent_speaking
+        nonlocal _current_speech_handle
         nonlocal _interrupt_requested
 
         logger.info(f"Streaming response for: {user_text}")
 
         async def tts_worker():
+            nonlocal _current_speech_handle
 
             while True:
 
@@ -314,10 +338,21 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 if chunk is None:
                     break
 
+                if _interrupt_requested:
+                    logger.info(f"Dropping queued TTS chunk after interruption: {chunk}")
+                    tts_queue.task_done()
+                    continue
+
                 try:
-                    await session.say(chunk)
+                    _current_speech_handle = session.say(
+                        chunk,
+                        add_to_chat_ctx=False,
+                    )
+                    await _current_speech_handle
                 except Exception as e:
                     logger.warning(f"TTS worker error: {e}")
+                finally:
+                    _current_speech_handle = None
 
                 tts_queue.task_done()
 
@@ -325,92 +360,143 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         worker_task = asyncio.create_task(tts_worker())
 
         ctx = ChatContext()
-        ctx.append(
+        ctx.add_message(
             role="system",
-            text="Reply under 5 words."
+            content=(
+                "Reply in 3-6 words. One sentence. "
+                "No apologies. No preamble. If unclear, say: Please repeat."
+            )
         )
 
-        ctx.append(
+        ctx.add_message(
             role="user",
-            text=user_text
+            content=user_text
         )
-
-        stream = session.llm.chat(chat_ctx=ctx)
 
         current_sentence = ""
+        stop_streaming = False
+        first_chunk_time: float | None = None
 
-        async for chunk in stream:
+        try:
+            async with session.llm.chat(
+                chat_ctx=ctx,
+                extra_kwargs={"max_tokens": OLLAMA_MAX_TOKENS},
+            ) as stream:
+                async for chunk in stream:
 
-            # interruption support
-            if _interrupt_requested:
-                logger.info("LLM stream interrupted")
-                break
+                    # interruption support
+                    if _interrupt_requested:
+                        logger.info("LLM stream interrupted")
+                        break
 
-            token = chunk.delta.content or ""
+                    if not chunk.delta or not chunk.delta.content:
+                        continue
 
-            generated_chars += len(token)
+                    token = chunk.delta.content
+                    generated_chars += len(token)
 
-            # hard cutoff
-            if generated_chars > 20:
-                logger.info("Generation cutoff reached")
-                break
+                    if first_chunk_time is None:
+                        first_chunk_time = time.perf_counter()
 
-            if not token:
-                continue
+                        if _transcription_time is not None:
+                            logger.info(
+                                "LLM TTFT: %.0fms",
+                                (first_chunk_time - _transcription_time) * 1000,
+                            )
 
-            current_sentence += token
+                    logger.info(
+                        "LLM RAW CHUNK: %d chars: %r",
+                        len(token),
+                        token[:120],
+                    )
 
-            # FORCE ultra-fast streaming
-            if len(current_sentence.strip()) >= 8:
+                    current_sentence += token
 
-                chunk_text = current_sentence.strip()
+                    # Ollama/LiveKit deltas can be large. Split them here so TTS
+                    # sees tiny chunks even when the upstream stream is buffered.
+                    parts = current_sentence.split()
 
-                logger.info(f"EARLY TTS: {chunk_text}")
+                    # Do not wait for the full word chunk when the model has
+                    # already produced a clean short acknowledgement.
+                    if (
+                        parts
+                        and len(parts) < EARLY_TTS_WORDS
+                        and current_sentence.strip().endswith((".", "!", "?", ",", ";", ":"))
+                        and emitted_words < MAX_TTS_WORDS
+                        and not _interrupt_requested
+                    ):
+                        remaining_words = MAX_TTS_WORDS - emitted_words
+                        words_to_emit = min(len(parts), remaining_words)
+                        chunk_text = " ".join(parts[:words_to_emit])
 
-                _agent_speaking = True
+                        logger.info(f"EARLY TTS: {chunk_text}")
 
-                await tts_queue.put(chunk_text)
+                        _agent_speaking = True
 
-                current_sentence = ""
-                
-            '''if len(current_sentence) > 30:
-                should_emit = True
+                        await tts_queue.put(chunk_text)
 
-            logger.info(f"TOKEN: {token}") '''
+                        emitted_words += words_to_emit
+                        parts = parts[words_to_emit:]
 
-            '''# sentence boundary detection
-            words = current_sentence.split()
+                    words = current_sentence.strip().split()
 
-            should_emit = (
-                len(current_sentence) > 8
-                or any(p in token for p in [".", "!", "?"])
-            )
+                    should_emit = (
+                        len(words) >= EARLY_TTS_WORDS
+                        and (
+                            token.endswith((" ", ".", "!", "?", ","))
+                            or len(words) >= MAX_TTS_WORDS
+                        )
+                    )
 
-            if should_emit:
+                    if (
+                        should_emit
+                        and emitted_words < MAX_TTS_WORDS
+                        and not _interrupt_requested
+                    ):
 
-                chunk_text = current_sentence.strip()
+                        chunk_text = current_sentence.strip()
 
-                if chunk_text:
+                        logger.info(f"EARLY TTS: {chunk_text}")
 
-                    logger.info(f"TTS CHUNK: {chunk_text}")
+                        _agent_speaking = True
 
-                    _agent_speaking = True
-                    chunk_text = chunk_text[:50]
-                    await tts_queue.put(chunk_text)
-                    
+                        await tts_queue.put(chunk_text)
 
-                current_sentence = "" '''
+                        emitted_words += len(words)
+
+                        current_sentence = ""
+
+                    current_sentence = " ".join(parts)
+
+                    if emitted_words >= MAX_TTS_WORDS and not stop_streaming:
+                        logger.info("Local word cutoff reached")
+                        stop_streaming = True
+
+                    if stop_streaming:
+                        break
+        except Exception as e:
+            logger.exception(f"LLM stream failed: {e}")
 
         # leftover partial sentence
+        leftover_text = current_sentence.strip()
         if (
-            len(current_sentence.strip()) > 3
+            any(char.isalnum() for char in leftover_text)
             and not _interrupt_requested
+            and emitted_words < MAX_TTS_WORDS
         ):
-            await tts_queue.put(current_sentence.strip())
+            remaining_words = MAX_TTS_WORDS - emitted_words
+            chunk_text = " ".join(leftover_text.split()[:remaining_words])
 
-        # Keep only recent conversation turns
-        if hasattr(session, "_chat_ctx"):
-            session._chat_ctx.messages = session._chat_ctx.messages[-2:]
+            if chunk_text:
+                logger.info(f"EARLY TTS: {chunk_text}")
+                _agent_speaking = True
+                await tts_queue.put(chunk_text)
+
+        logger.info(
+            "LLM stream complete: %d raw chars, %d emitted words",
+            generated_chars,
+            emitted_words,
+        )
 
         await tts_queue.put(None)
 
@@ -430,18 +516,23 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 continue
 
             silence_duration = time.perf_counter() - _last_speech_time
+            transcript = _partial_transcript.strip()
+            has_speech_text = (
+                len(transcript) >= MIN_FINAL_TRANSCRIPT_CHARS
+                and any(char.isalnum() for char in transcript)
+            )
 
             # Finalize only if:
             # - user stopped speaking
             # - enough silence passed
             should_finalize = (
                 not _user_speaking
-                and silence_duration > 1.0
-                and len(_partial_transcript.split()) > 2
+                and silence_duration > FINALIZE_SILENCE_SECONDS
+                and has_speech_text
             )
 
             if should_finalize:
-                final_text = _partial_transcript.strip()
+                final_text = transcript
 
                 logger.info(f"FINALIZED: {final_text}")
 

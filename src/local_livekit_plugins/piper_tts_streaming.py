@@ -29,6 +29,7 @@ import re
 import time
 import uuid
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, AsyncIterator
 
 from livekit.agents import tts, APIConnectOptions
@@ -95,7 +96,7 @@ class _PiperStreamingChunkedStream(tts.ChunkedStream):
             # Synthesize in thread pool (non-blocking)
             sentence_start = time.perf_counter()
             audio_bytes = await loop.run_in_executor(
-                None,
+                self._piper_tts.executor,
                 self._synthesize_blocking,
                 sentence.strip()
             )
@@ -223,6 +224,10 @@ class PiperTTSStreaming(tts.TTS):
         self.noise_scale = noise_scale
         self.noise_w = noise_w
         self.streaming = streaming  # Kept for API compatibility, unused
+        self.executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="piper-tts",
+        )
 
         logger.info(f"Loading Piper voice: {model_path}")
         logger.info(f"  CUDA: {use_cuda}")
