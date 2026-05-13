@@ -46,8 +46,9 @@ from livekit.plugins import openai as lk_openai
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 # Local plugins - use streaming TTS
-from local_livekit_plugins import FasterWhisperSTT
-from local_livekit_plugins.piper_tts_streaming import PiperTTSStreaming
+#from local_livekit_plugins import FasterWhisperSTT
+from local_livekit_plugins import GrokSTT, GrokTTS
+#from local_livekit_plugins.piper_tts_streaming import PiperTTSStreaming
 
 # Configure logging
 logging.basicConfig(
@@ -55,6 +56,9 @@ logging.basicConfig(
     format="%(asctime)s | %(name)-20s | %(levelname)-8s | %(message)s"
 )
 logger = logging.getLogger("voice-agent-optimized")
+logging.getLogger("faster_whisper").setLevel(logging.WARNING)
+logging.getLogger("local_livekit_plugins").setLevel(logging.WARNING)
+logging.getLogger("livekit").setLevel(logging.WARNING)
 
 
 # =============================================================================
@@ -64,15 +68,15 @@ logger = logging.getLogger("voice-agent-optimized")
 USE_LOCAL = os.getenv("USE_LOCAL", "true").lower() == "true"
 
 # STT: Use smaller/faster Whisper model
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny.en")  # tiny.en is fastest for English
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "distil-small.en")  # tiny.en is fastest for English
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv(
     "WHISPER_COMPUTE_TYPE",
     "float16" if WHISPER_DEVICE == "cuda" else "int8",
 )
-WHISPER_MAX_AUDIO_SECONDS = float(os.getenv("WHISPER_MAX_AUDIO_SECONDS", "2.0"))
+WHISPER_MAX_AUDIO_SECONDS = float(os.getenv("WHISPER_MAX_AUDIO_SECONDS", "0.0"))
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "false").lower() == "true"
-FINALIZE_SILENCE_SECONDS = float(os.getenv("FINALIZE_SILENCE_SECONDS", "0.6"))
+FINALIZE_SILENCE_SECONDS = float(os.getenv("FINALIZE_SILENCE_SECONDS", "0.5"))
 MIN_FINAL_TRANSCRIPT_CHARS = int(os.getenv("MIN_FINAL_TRANSCRIPT_CHARS", "2"))
 
 # TTS: Streaming with 1.5x speed for lower latency
@@ -81,11 +85,11 @@ PIPER_SPEED = float(os.getenv("PIPER_SPEED", "1.0"))  # 50% faster speech
 PIPER_USE_CUDA = os.getenv("PIPER_USE_CUDA", "false").lower() == "true"
 
 # LLM: Use faster model if available
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:latest")  # use `ollama list` for installed names
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")  # use `ollama list` for installed names
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "20"))
+OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "25"))
 EARLY_TTS_WORDS = max(1, int(os.getenv("EARLY_TTS_WORDS", "3")))
-MAX_TTS_WORDS = max(EARLY_TTS_WORDS, int(os.getenv("MAX_TTS_WORDS", "8")))
+MAX_TTS_WORDS = max(EARLY_TTS_WORDS, int(os.getenv("MAX_TTS_WORDS", "20")))
 
 
 # =============================================================================
@@ -148,10 +152,11 @@ def create_optimized_local_session() -> AgentSession:
 
     turn_detector = MultilingualModel()
     stt_vad = silero.VAD.load(
-        min_speech_duration=0.1,
-        min_silence_duration=0.2,
+        min_speech_duration=0.25,
+        min_silence_duration=1.0,
         prefix_padding_duration=0.1,
-        max_buffered_speech=1.5,
+        max_buffered_speech=8.0,
+        activation_threshold=0.15,
     )
 
     if not PIPER_MODEL_PATH:
@@ -162,14 +167,20 @@ def create_optimized_local_session() -> AgentSession:
 
     return AgentSession(
         # STT: Streaming-capable whisper with VAD-based chunking
-        stt=FasterWhisperSTT(
-            model_size=WHISPER_MODEL,
-            device=WHISPER_DEVICE,
-            compute_type=WHISPER_COMPUTE_TYPE,  # Quantized for speed
-            vad_filter=WHISPER_VAD_FILTER,
-            streaming=True,
-            vad=stt_vad,
-            max_audio_seconds=WHISPER_MAX_AUDIO_SECONDS,
+        #stt=FasterWhisperSTT(
+        #    model_size=WHISPER_MODEL,
+        #    device=WHISPER_DEVICE,
+        #    compute_type=WHISPER_COMPUTE_TYPE,  # Quantized for speed
+        #    vad_filter=WHISPER_VAD_FILTER,
+        #    streaming=False,  # Enable streaming mode
+        #   vad=stt_vad,
+        #    max_audio_seconds=WHISPER_MAX_AUDIO_SECONDS,
+        #), 
+
+        stt=GrokSTT(
+            api_key=os.getenv("GROK_API_KEY_STT"),
+            model="grok-1",
+            language="en",
         ),
         # LLM: Streaming is automatic with LiveKit agents
         llm=lk_openai.LLM.with_ollama(
@@ -179,11 +190,18 @@ def create_optimized_local_session() -> AgentSession:
         ), 
         # TTS: Uses internal sentence-level streaming for low-latency synthesis
         # (not LiveKit's streaming interface, but achieves same effect)
-        tts=PiperTTSStreaming(
-            model_path=PIPER_MODEL_PATH,
-            use_cuda=PIPER_USE_CUDA,
-            speed=PIPER_SPEED,  # 1.5 = 50% faster
-            streaming=False,    # Uses internal sentence-level streaming (compatible)
+        #tts=PiperTTSStreaming(
+        #    model_path=PIPER_MODEL_PATH,
+        #    use_cuda=PIPER_USE_CUDA,
+        #    speed=PIPER_SPEED,  # 1.5 = 50% faster
+        #    streaming=False,    # Uses internal sentence-level streaming (compatible)
+        #),
+
+        tts=GrokTTS(
+            api_key=os.getenv("GROK_API_KEY_TTS"),
+            voice="eve",
+            language="en",
+            sample_rate=24000,
         ),
         vad=stt_vad,
         turn_detection=turn_detector,
@@ -210,10 +228,11 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     _transcription_time: float | None = None
     _chunk_count = 0
     _first_audio_time: float | None = None
+    _stt_start_time: float | None = None
 
     # Transcript stabilization state
     _partial_transcript = ""
-    _last_speech_time = 0.0
+    _last_speech_time = time.perf_counter()
     _user_speaking = False
     _eou_probability = 0.0
     _agent_speaking = False
@@ -223,15 +242,21 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(ev) -> None:
         nonlocal _transcription_time
+        nonlocal _stt_start_time
         nonlocal _chunk_count
         nonlocal _first_audio_time
         nonlocal _partial_transcript
+
+        # ignore assistant echo
+        
 
         _transcription_time = time.perf_counter()
         _chunk_count = 0
         _first_audio_time = None
 
         text = ev.transcript.strip()
+        if _stt_start_time is None:
+            _stt_start_time = time.perf_counter()
 
         if text:
             # Merge partial transcript progressively
@@ -247,31 +272,28 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         nonlocal _current_speech_handle
         nonlocal _interrupt_requested
         logger.info(f"Agent speaking state: {_agent_speaking}")
+        logger.info("VAD DETECTED SPEECH")
 
         _user_speaking = True
 
         # User interrupted assistant speech
-        if _agent_speaking:
-            
-            logger.info("User interruption detected")
+        # only interrupt on REAL transcript
+        if (
+            _agent_speaking
+            and len(_partial_transcript.strip().split()) >= 2
+        ):
+
+            logger.info("Real user interruption detected")
 
             _interrupt_requested = True
 
-            # Clear previous transcript state
-            _partial_transcript = ""
-
-            # Stop assistant speaking state
-            _agent_speaking = False
-
-            # Cancel current speech
+            # cancel current speech
             if _current_speech_handle:
                 try:
                     _current_speech_handle.interrupt(force=True)
                     logger.info("Current speech cancelled")
                 except Exception as e:
                     logger.warning(f"Speech cancel failed: {e}")
-
-            logger.debug("User started speaking")
 
     @session.on("user_stopped_speaking")
     def on_user_stopped_speaking():
@@ -286,6 +308,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         nonlocal _first_audio_time
         nonlocal _agent_speaking
         nonlocal _partial_transcript
+
 
         if ev.new_state == "speaking":
             _agent_speaking = True
@@ -306,8 +329,6 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
                 _transcription_time = None
 
-        else:
-            _agent_speaking = False
 
     @session.on("agent_state_changed")
     def on_state_change(ev):
@@ -349,10 +370,16 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                         add_to_chat_ctx=False,
                     )
                     await _current_speech_handle
+
+                    await asyncio.sleep(0.15)  # allow some time for the speech to start before processing next chunk
+
                 except Exception as e:
                     logger.warning(f"TTS worker error: {e}")
                 finally:
                     _current_speech_handle = None
+
+                    # safe speaking reset
+                    _agent_speaking = False
 
                 tts_queue.task_done()
 
@@ -363,8 +390,9 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         ctx.add_message(
             role="system",
             content=(
-                "Reply in 3-6 words. One sentence. "
-                "No apologies. No preamble. If unclear, say: Please repeat."
+                "Reply naturally in one short sentence. "
+                "Maximum 10 words. "
+                "Never give long explanations."
             )
         )
 
@@ -404,11 +432,11 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                                 (first_chunk_time - _transcription_time) * 1000,
                             )
 
-                    logger.info(
-                        "LLM RAW CHUNK: %d chars: %r",
-                        len(token),
-                        token[:120],
-                    )
+                    #logger.info(
+                    #    "LLM RAW CHUNK: %d chars: %r",
+                    #    len(token),
+                    #    token[:120],
+                    #)
 
                     current_sentence += token
 
@@ -434,6 +462,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                         _agent_speaking = True
 
                         await tts_queue.put(chunk_text)
+
+                        await asyncio.sleep(0.15)
+
+                        # soft limit only
+                        if emitted_words >= MAX_TTS_WORDS:
+                            logger.info("Reached soft word target")
 
                         emitted_words += words_to_emit
                         parts = parts[words_to_emit:]
@@ -462,23 +496,28 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
                         await tts_queue.put(chunk_text)
 
+                        # soft limit only
+                        if emitted_words >= MAX_TTS_WORDS:
+                            logger.info("Reached soft word target")
+
                         emitted_words += len(words)
 
                         current_sentence = ""
+                        parts = []
 
                     current_sentence = " ".join(parts)
 
-                    if emitted_words >= MAX_TTS_WORDS and not stop_streaming:
-                        logger.info("Local word cutoff reached")
-                        stop_streaming = True
-
-                    if stop_streaming:
-                        break
+                    
         except Exception as e:
             logger.exception(f"LLM stream failed: {e}")
 
         # leftover partial sentence
         leftover_text = current_sentence.strip()
+
+        # ignore tiny leftovers
+        if len(leftover_text.split()) < 2:
+            leftover_text = ""
+
         if (
             any(char.isalnum() for char in leftover_text)
             and not _interrupt_requested
@@ -492,6 +531,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 _agent_speaking = True
                 await tts_queue.put(chunk_text)
 
+                # soft limit only
+                if emitted_words >= MAX_TTS_WORDS:
+                    logger.info("Reached soft word target")
+
         logger.info(
             "LLM stream complete: %d raw chars, %d emitted words",
             generated_chars,
@@ -504,10 +547,84 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         
         _agent_speaking = False
     # =========================================================================
+    ## NOTE: The following WAV injection code is for testing and demonstration purposes.
+    ## It simulates a user speaking from a pre-recorded audio file, allowing us to test the full pipeline (STT -> LLM -> TTS) with controlled input. In a
+    '''async def inject_wav_audio(session, wav_path):
+
+        import wave
+        import numpy as np
+        from livekit.rtc import AudioFrame
+
+        logger.info(f"Injecting WAV audio: {wav_path}")
+
+        wf = wave.open(wav_path, "rb")
+
+        sample_rate = wf.getframerate()
+        channels = wf.getnchannels()
+
+        chunk_ms = 500
+        chunk_size = int(sample_rate * chunk_ms / 1000)
+
+        collected = []
+
+        while True:
+
+            frames = wf.readframes(chunk_size)
+
+            if not frames:
+                break
+
+            audio_np = np.frombuffer(
+                frames,
+                dtype=np.int16
+            )
+
+            collected.append(audio_np)
+
+            full_audio = np.concatenate(collected)
+
+            frame = AudioFrame(
+                data=full_audio.tobytes(),
+                sample_rate=sample_rate,
+                num_channels=channels,
+                samples_per_channel=len(full_audio),
+            )
+
+            try:
+
+                result = await session.stt.recognize(frame)
+
+                if result.alternatives:
+
+                    text = result.alternatives[0].text.strip()
+
+                    if text:
+
+                        logger.info(
+                            f"WAV TRANSCRIPT: {text}"
+                        )
+
+                        await stream_llm_to_tts(
+                            session,
+                            text
+                        )
+
+                        break
+
+            except Exception as e:
+                logger.warning(f"WAV inject error: {e}")
+
+            await asyncio.sleep(chunk_ms / 1000)
+
+        logger.info("WAV injection complete")  '''
+    #==================================================================================================
+
+
     async def transcript_monitor():
         nonlocal _partial_transcript
         nonlocal _user_speaking
         nonlocal _last_speech_time
+        nonlocal _stt_start_time
 
         while True:
             await asyncio.sleep(0.1)
@@ -534,6 +651,16 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             if should_finalize:
                 final_text = transcript
 
+                if _stt_start_time is not None:
+
+                    stt_ms = (
+                        time.perf_counter() - _stt_start_time
+                    ) * 1000
+
+                    print(f"\nSTT TIME: {stt_ms:.0f}ms")
+
+                    _stt_start_time = None
+
                 logger.info(f"FINALIZED: {final_text}")
 
                 _partial_transcript = ""
@@ -553,6 +680,15 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     )
 
     await session.say("Hello, ready.")
+
+    #=========================================
+    '''wav_path = os.path.join(
+        os.path.dirname(__file__),
+        "test.wav"
+    )
+
+    await inject_wav_audio(session, wav_path)'''
+    #=====================================================================================
 
     asyncio.create_task(transcript_monitor())
 

@@ -1,0 +1,19 @@
+[33m3a25796[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m Grok STT and TTS implimented
+[33me86cdc8[m Grok STT and TTS implimented
+[33m9dbd43f[m Grok STT and TTS implimented
+[33mb814bcd[m Grok STT and TTS implimented
+[33mb6e9969[m[33m ([m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m chuck base update flow
+[33m4e0da7a[m Made LLM and TTS are parallel
+[33m66afa80[m STT latency improved and LLM latency improved
+[33md75b6ec[m Added streaming STT and streaming TTS optimizations
+[33m80bd9e4[m Add Docker support for easy cross-platform deployment
+[33mfa8f097[m Add STT streaming support with VAD-based chunking
+[33m80a7078[m Save local changes and push to GitHub
+[33m598d56d[m Updated author in pyproject.toml
+[33m0135eba[m fix: Update uv.lock after pull
+[33mae7d626[m feat: Rename repository and update references to local-livekit-plugins
+[33mbed0643[m Update repository references in README.md
+[33m231b6b4[m Update project title in README.md
+[33m8b5e33b[m Update documentation and configuration
+[33m4ddd137[m Add CLAUDE.md, remove CAAL Project reference in README.md, for addition later.
+[33me1d3e20[m Initial release: Local STT/TTS plugins for LiveKit Agents

@@ -170,16 +170,31 @@ class FasterWhisperSTT(stt.STT):
         # Use provided language or fall back to configured default
         lang = language if language is not NOT_GIVEN else self._language
 
+        # Determine REAL sample rate
+        sample_rate = 16000
+
+        if isinstance(buffer, list) and len(buffer) > 0:
+            sample_rate = buffer[0].sample_rate
+        elif not isinstance(buffer, list):
+            sample_rate = buffer.sample_rate
+
         if self._max_audio_seconds > 0:
-            max_samples = int(16000 * self._max_audio_seconds)
+
+            max_samples = int(
+                sample_rate * self._max_audio_seconds
+            )
 
             if len(audio_data) > max_samples:
+
                 logger.debug(
                     "Trimming STT audio from %.1fs to %.1fs",
-                    len(audio_data) / 16000,
+                    len(audio_data) / sample_rate,
                     self._max_audio_seconds,
                 )
+
+                # Keep EARLY speech
                 audio_data = audio_data[-max_samples:]
+        
 
         # Throttle inference rate
         now = time.perf_counter()
@@ -207,8 +222,9 @@ class FasterWhisperSTT(stt.STT):
 
         # Rolling partial transcript accumulation
         # Streaming transcript overwrite
+        # realtime streaming hypothesis
         if text:
-            self._partial_text = text
+            self._partial_text = text.strip()
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
 
@@ -260,6 +276,7 @@ class FasterWhisperSTT(stt.STT):
             language=lang,
             condition_on_previous_text=False,
             without_timestamps=True,
+            no_speech_threshold=0.9,
         )
 
         text = "".join(segment.text for segment in segments).strip()
