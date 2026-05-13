@@ -67,6 +67,26 @@ class GrokTTSStream(tts.SynthesizeStream):
 
         self._tts = tts_instance
 
+    async def _collect_audio(self, ws, output_emitter):
+        """Receive audio chunks until audio.done."""
+        while True:
+            msg = await ws.recv()
+            data = json.loads(msg)
+            event_type = data.get("type", "")
+
+            if event_type == "audio.delta":
+                audio_bytes = base64.b64decode(data["delta"])
+                output_emitter.push(audio_bytes)
+
+            elif event_type == "audio.done":
+                output_emitter.end_segment()
+                output_emitter.flush()
+                break
+
+            elif event_type == "error":
+                print("TTS ERROR:", data)
+                break
+
     async def _run(self, output_emitter):
 
         ws_url = (
@@ -77,7 +97,6 @@ class GrokTTSStream(tts.SynthesizeStream):
             f"&sample_rate={self._tts._sample_rate}"
             f"&optimize_streaming_latency=1"
         )
-                
 
         output_emitter.initialize(
             request_id="grok_tts",
@@ -87,129 +106,96 @@ class GrokTTSStream(tts.SynthesizeStream):
             stream=True,
         )
 
+        segment_counter = 0
+        segment_started = False
+
         async with websockets.connect(
             ws_url,
-            additional_headers={
-                "Authorization": f"Bearer {self._tts.api_key}"
-            }
+            additional_headers={"Authorization": f"Bearer {self._tts.api_key}"},
+            ping_interval=20,
+            ping_timeout=10,
         ) as ws:
-
-            buffer = ""
 
             async for text in self._input_ch:
 
-                print("INPUT_CHUNK:", text)
-                print("TYPE:", type(text))
-
-                # Flush => synthesize current buffered text
-                if "FlushSentinel" in str(type(text)):
-
-                    final_text = buffer.strip()
-                    buffer = ""
-
-                    if not final_text:
+                # String token — stream it to xAI immediately
+                if isinstance(text, str):
+                    text_str = text.strip()
+                    if not text_str:
                         continue
 
-                    print("FINAL TEXT:", final_text)
+                    if not segment_started:
+                        segment_id = f"segment_{segment_counter}"
+                        segment_counter += 1
+                        output_emitter.start_segment(segment_id=segment_id)
+                        segment_started = True
 
-                    segment_id = "segment_0"
+                    await ws.send(json.dumps({"type": "text.delta", "delta": text}))
 
-                    output_emitter.start_segment(
-                        segment_id=segment_id
-                    )
+                    # Close as soon as sentence ends — don't wait for FlushSentinel
+                    if text_str in [".", "!", "?"] or text_str.endswith((".", "!", "?")):
+                        await ws.send(json.dumps({"type": "text.done"}))
+                        segment_started = False
+                        await self._collect_audio(ws, output_emitter)
 
-                    # Send text to xAI
-                    await ws.send(json.dumps({
-                        "type": "text.delta",
-                        "delta": final_text,
-                    }))
+                # WORD BY WORD STEAMING
+                # if isinstance(text, str):
+                #     text_str = text.strip()
+                #     if not text_str:
+                #         continue
 
-                    await ws.send(json.dumps({
-                        "type": "text.done"
-                    }))
+                #     if not segment_started:
+                #         segment_id = f"segment_{segment_counter}"
+                #         segment_counter += 1
+                #         output_emitter.start_segment(segment_id=segment_id)
+                #         segment_started = True
 
-                    # Receive streamed audio for THIS text batch
+                #     # Send the word
+                #     await ws.send(json.dumps({"type": "text.delta", "delta": text}))
+
+                #     # If this token starts with a space OR is punctuation = previous word is complete
+                #     # Send text.done after every complete word
+                #     next_token_starts_new_word = text.startswith(" ") or text_str in [".", "!", "?"]
+                    
+                #     if next_token_starts_new_word:
+                #         await ws.send(json.dumps({"type": "text.done"}))
+                #         segment_started = False
+                #         await self._collect_audio(ws, output_emitter)
+                        
+                #         # Start fresh segment for next word
+                #         segment_id = f"segment_{segment_counter}"
+                #         segment_counter += 1
+                #         output_emitter.start_segment(segment_id=segment_id)
+                #         segment_started = True
+
+                # FlushSentinel — close the text stream, collect audio
+                elif "FlushSentinel" in str(type(text)):
+
+                    if not segment_started:
+                        # Nothing was buffered, skip
+                        continue
+
+                    # Tell xAI we're done sending text
+                    await ws.send(json.dumps({"type": "text.done"}))
+                    segment_started = False
+
+                    # Now receive the audio
                     while True:
-
-                        print("WAITING FOR TTS...")
-
                         msg = await ws.recv()
-
                         data = json.loads(msg)
-
                         event_type = data.get("type", "")
 
-                        # AUDIO CHUNK
                         if event_type == "audio.delta":
-
-                            print("AUDIO DELTA RECEIVED")
-
                             audio_bytes = base64.b64decode(data["delta"])
+                            output_emitter.push(audio_bytes)
 
-                            pcm = np.frombuffer(audio_bytes, dtype=np.int16)
-
-                            print("PCM SAMPLES:", len(pcm))
-
-                            FRAME_SIZE = 240
-
-                            for i in range(0, len(pcm), FRAME_SIZE):
-
-                                chunk = pcm[i:i + FRAME_SIZE]
-
-                                if len(chunk) == 0:
-                                    continue
-
-                                #print("SENDING FRAME:", len(chunk))
-
-                                frame = rtc.AudioFrame(
-                                    data=chunk.tobytes(),
-                                    sample_rate=self._tts._sample_rate,
-                                    num_channels=1,
-                                    samples_per_channel=len(chunk),
-                                )
-
-                                self._event_ch.send_nowait(
-                                    tts.SynthesizedAudio(
-                                        request_id="grok_tts",
-                                        segment_id="0",
-                                        frame=frame,
-                                        delta_text="",
-                                    )
-                                )
-
-                        # END OF THIS SYNTHESIS
                         elif event_type == "audio.done":
-
-                            print("AUDIO DONE")
-
                             output_emitter.end_segment()
-
                             output_emitter.flush()
-
                             break
 
-                        # ERROR
                         elif event_type == "error":
-
                             print("TTS ERROR:", data)
-
                             break
-
-                    continue
-
-                # Ignore non-string objects
-                if not isinstance(text, str):
-                    continue
-
-                text_str = text.strip()
-
-                if not text_str:
-                    continue
-
-                # Better punctuation handling
-                if text_str in [".", ",", "!", "?"]:
-                    buffer = buffer.rstrip() + text_str + " "
-                else:
-                    buffer += text_str + " "
-                
+                    
             

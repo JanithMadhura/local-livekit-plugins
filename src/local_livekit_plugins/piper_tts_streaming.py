@@ -68,7 +68,6 @@ class _PiperStreamingChunkedStream(tts.ChunkedStream):
         await super().aclose()
         
     async def _run(self, emitter: AudioEmitter) -> None:
-        """Stream audio chunks as sentences are synthesized."""
         emitter.initialize(
             request_id=str(uuid.uuid4()),
             sample_rate=self._piper_tts.sample_rate,
@@ -77,47 +76,57 @@ class _PiperStreamingChunkedStream(tts.ChunkedStream):
         )
 
         start_time = time.perf_counter()
-        chunks_emitted = 0
-        total_chars = len(self._input_text)
 
-        # Split into sentences for streaming
-        sentences = self._split_sentences(self._input_text)
-        logger.debug(f"TTS streaming {len(sentences)} sentences for {total_chars} chars")
+        sentences = self._split_sentences(self.input_text)
 
-        # Process sentences in order, stream as they're ready
+        # Word-level chunking (for testing, not recommended for natural speech)
+        # sentences = self._split_phrases(
+        #     self._input_text,
+        #     chunk_size=1, 
+        # )
+
+        sentences = [s.strip() for s in sentences if s.strip()]
+
         loop = asyncio.get_running_loop()
-        for sentence in sentences:
+
+        # Launch ALL sentences concurrently
+        tasks = [
+            loop.run_in_executor(self._piper_tts.executor, self._synthesize_blocking, s)
+            for s in sentences
+        ]
+
+        # Collect results IN ORDER (concurrent synthesis, ordered playback)
+
+        #================================================================================================================
+        # Streaming sentences as they complete - 
+        results = await asyncio.gather(*tasks)
+
+        for i, audio_bytes in enumerate(results):
             if self._interrupted:
-                logger.info("TTS interrupted")
                 break
-            if not sentence.strip():
-                continue
-
-            # Synthesize in thread pool (non-blocking)
-            sentence_start = time.perf_counter()
-            audio_bytes = await loop.run_in_executor(
-                self._piper_tts.executor,
-                self._synthesize_blocking,
-                sentence.strip()
-            )
-            sentence_time = (time.perf_counter() - sentence_start) * 1000
-
-            # Emit immediately - audio playback can start now
             emitter.push(audio_bytes)
-            if self._interrupted:
-                logger.info("TTS interrupted before playback")
-                break
-            chunks_emitted += 1
-            logger.debug(
-                f"Streamed sentence {chunks_emitted}: "
-                f"{len(sentence.strip())} chars in {sentence_time:.0f}ms"
-            )
+            logger.debug(f"Streamed sentence {i+1}/{len(sentences)}")
+        #================================================================================================================
+
+        #================================================================================================================
+        #Streaming chunks as they complete - 
+        # for i, task in enumerate(tasks):
+
+        #     if self._interrupted:
+        #         break
+
+        #     audio_bytes = await task
+
+        #     emitter.push(audio_bytes)
+
+        #     logger.debug(
+        #         f"Streamed chunk {i+1}/{len(tasks)}"
+        #     )
+
+        #================================================================================================================
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000
-        logger.info(
-            f"TTS streaming complete: {elapsed_ms:.0f}ms total "
-            f"({chunks_emitted} chunks, {total_chars} chars)"
-        )
+        logger.info(f"TTS complete: {elapsed_ms:.0f}ms ({len(sentences)} sentences)")
 
     def _split_sentences(self, text: str) -> list[str]:
         """
@@ -132,6 +141,20 @@ class _PiperStreamingChunkedStream(tts.ChunkedStream):
         # Split on sentence boundaries while keeping delimiters
         sentences = re.split(r'(?<=[.!?\n])\s+', text)
         return [s for s in sentences if s.strip()]
+
+    def _split_phrases(self, text: str, chunk_size: int = 1):
+
+        words = text.split()
+
+        chunks = []
+
+        for i in range(0, len(words), chunk_size):
+
+            chunk = " ".join(words[i:i + chunk_size])
+
+            chunks.append(chunk)
+
+        return chunks
 
     def _synthesize_blocking(self, text: str) -> bytes:
         """Blocking synthesis - runs in thread pool."""
@@ -225,7 +248,7 @@ class PiperTTSStreaming(tts.TTS):
         self.noise_w = noise_w
         self.streaming = streaming  # Kept for API compatibility, unused
         self.executor = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=3,
             thread_name_prefix="piper-tts",
         )
 

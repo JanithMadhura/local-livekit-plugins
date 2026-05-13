@@ -26,6 +26,7 @@ import os
 import sys
 import time
 import asyncio
+import random
 
 # Add parent directory to path for local development
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -46,9 +47,9 @@ from livekit.plugins import openai as lk_openai
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 # Local plugins - use streaming TTS
-#from local_livekit_plugins import FasterWhisperSTT
+from local_livekit_plugins import FasterWhisperSTT
 from local_livekit_plugins import GrokSTT, GrokTTS
-#from local_livekit_plugins.piper_tts_streaming import PiperTTSStreaming
+from local_livekit_plugins.piper_tts_streaming import PiperTTSStreaming
 
 # Configure logging
 logging.basicConfig(
@@ -85,7 +86,7 @@ PIPER_SPEED = float(os.getenv("PIPER_SPEED", "1.0"))  # 50% faster speech
 PIPER_USE_CUDA = os.getenv("PIPER_USE_CUDA", "false").lower() == "true"
 
 # LLM: Use faster model if available
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")  # use `ollama list` for installed names
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3")  # use `ollama list` for installed names
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "25"))
 EARLY_TTS_WORDS = max(1, int(os.getenv("EARLY_TTS_WORDS", "3")))
@@ -190,19 +191,19 @@ def create_optimized_local_session() -> AgentSession:
         ), 
         # TTS: Uses internal sentence-level streaming for low-latency synthesis
         # (not LiveKit's streaming interface, but achieves same effect)
-        #tts=PiperTTSStreaming(
-        #    model_path=PIPER_MODEL_PATH,
-        #    use_cuda=PIPER_USE_CUDA,
-        #    speed=PIPER_SPEED,  # 1.5 = 50% faster
-        #    streaming=False,    # Uses internal sentence-level streaming (compatible)
-        #),
-
-        tts=GrokTTS(
-            api_key=os.getenv("GROK_API_KEY_TTS"),
-            voice="eve",
-            language="en",
-            sample_rate=24000,
+        tts=PiperTTSStreaming(
+            model_path=PIPER_MODEL_PATH,
+            use_cuda=PIPER_USE_CUDA,
+            speed=PIPER_SPEED,  # 1.5 = 50% faster
+            streaming=False,    # Uses internal sentence-level streaming (compatible)
         ),
+
+        # tts=GrokTTS(
+        #    api_key=os.getenv("GROK_API_KEY_TTS"),
+        #    voice="eve",
+        #    language="en",
+        #    sample_rate=24000,
+        # ),
         vad=stt_vad,
         turn_detection=turn_detector,
     )
@@ -349,8 +350,71 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
         logger.info(f"Streaming response for: {user_text}")
 
+        fillers = {
+            "question": [
+                "Good question.",
+                "Interesting.",
+                "Let me think.",
+            ],
+
+            "explanation": [
+                "Alright.",
+                "Okay.",
+                "Let me explain.",
+            ],
+
+            "default": [
+                "Okay.",
+                "Sure.",
+            ]
+        }
+
+        def detect_filler_type(user_text: str):
+
+            text = user_text.lower()
+
+            # explanation / learning
+            if any(word in text for word in [
+                "explain",
+                "why",
+                "how",
+                "teach",
+                "what is",
+            ]):
+                return "explanation"
+
+            # question
+            if "?" in text:
+                return "question"
+
+            return "default"
+
+        async def play_filler():
+
+            try:
+
+                filler_type = detect_filler_type(user_text)
+
+                selected_filler = random.choice(
+                    fillers[filler_type]
+                )
+
+                logger.info(
+                    f"Selected filler: {selected_filler}"
+                )
+
+                await session.say(
+                    selected_filler,
+                    add_to_chat_ctx=False,
+                )
+
+            except Exception as e:
+
+                logger.warning(f"Filler playback failed: {e}")
+
         async def tts_worker():
             nonlocal _current_speech_handle
+            nonlocal filler_task
 
             while True:
 
@@ -405,6 +469,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         stop_streaming = False
         first_chunk_time: float | None = None
 
+        # This manual streaming loop allows us to push tokens into TTS as they arrive, without waiting for the full response.
+        filler_played = False
+        filler_task = None
+
         try:
             async with session.llm.chat(
                 chat_ctx=ctx,
@@ -421,6 +489,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                         continue
 
                     token = chunk.delta.content
+
                     generated_chars += len(token)
 
                     if first_chunk_time is None:
@@ -474,10 +543,26 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
                     words = current_sentence.strip().split()
 
+                    # decide filler BEFORE first TTS
+                    if (
+                        not filler_played
+                        and not emitted_words
+                        and len(words) >= EARLY_TTS_WORDS
+                        and not _interrupt_requested
+                    ):
+
+                        filler_played = True
+
+                        logger.info("Speaking filler FIRST")
+
+                        await play_filler()
+
+                        logger.info("Filler finished")
+
                     should_emit = (
                         len(words) >= EARLY_TTS_WORDS
                         and (
-                            token.endswith((" ", ".", "!", "?", ","))
+                            token.endswith((" ", ".", "!", "?"))
                             or len(words) >= MAX_TTS_WORDS
                         )
                     )
