@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import wave
 import numpy as np
-#import httpx
 import websockets
 import json
+import logging
 
 from livekit.agents import stt, APIConnectOptions, utils
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
+from livekit import rtc
+
+logger = logging.getLogger(__name__)
 
 
 class GrokSTT(stt.STT):
@@ -21,8 +25,8 @@ class GrokSTT(stt.STT):
     ):
         super().__init__(
             capabilities=stt.STTCapabilities(
-                streaming=False,
-                interim_results=False,
+                streaming=True,        # ← NOW streaming
+                interim_results=True,  # ← sends partials as user speaks
             )
         )
 
@@ -30,183 +34,195 @@ class GrokSTT(stt.STT):
         self._model = model
         self.language = language
 
-    async def _recognize_impl(
+    async def _recognize_impl(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Non-streaming recognition is not supported"
+        )
+
+    def stream(
         self,
-        buffer: utils.AudioBuffer,
         *,
         language: NotGivenOr[str] = NOT_GIVEN,
-        conn_options: APIConnectOptions,
-    ) -> stt.SpeechEvent:
-
-        if isinstance(buffer, list):
-
-            all_data = []
-
-            for frame in buffer:
-                frame_data = np.frombuffer(
-                    frame.data,
-                    dtype=np.int16
-                )
-
-                all_data.append(frame_data)
-
-            audio_data = np.concatenate(all_data)
-
-            sample_rate = buffer[0].sample_rate
-
-        else:
-
-            audio_data = np.frombuffer(
-                buffer.data,
-                dtype=np.int16
-            )
-
-            sample_rate = buffer.sample_rate
-
-        audio_bytes = audio_data.tobytes()
-
-        # Convert to WAV format in memory for HTTP REST API only
-        #wav_io = io.BytesIO()
-
-        #with wave.open(wav_io, "wb") as wav_file:
-
-        #    wav_file.setnchannels(1)
-
-        #    wav_file.setsampwidth(2)
-
-        #    wav_file.setframerate(sample_rate)
-
-        #    wav_file.writeframes(audio_data.tobytes())
-
-        #wav_io.seek(0)
-
-        #==============================================================================================================================================================
-        # for HTTP rest API
-        '''
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-        }
-
-        files = {
-            "file": ("audio.wav", wav_io, "audio/wav"),
-        }
-
-        data = {
-            "format": "true",
-            "language": language if language is not NOT_GIVEN else self.language,
-        }
-
-        async with httpx.AsyncClient(timeout=30) as client:
-
-            response = await client.post(
-                "https://api.x.ai/v1/stt",
-                headers=headers,
-                files=files,
-                data=data,
-            )
-
-            print("STATUS:", response.status_code)
-
-            result = response.json()
-
-            print("RESPONSE:", result)
-
-            # Handle API errors safely
-            if response.status_code != 200:
-
-                error_msg = result.get("error", "Unknown STT error")
-
-                print(f"Grok STT Error: {error_msg}")
-
-                return stt.SpeechEvent(
-                    type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                    alternatives=[
-                        stt.SpeechData(
-                            text="",
-                            start_time=0,
-                            end_time=0,
-                            language=self.language,
-                        )
-                    ],
-                )
-
-            text = result.get("text", "").strip()
-
-            return stt.SpeechEvent(
-                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                alternatives=[
-                    stt.SpeechData(
-                        text=text,
-                        start_time=0,
-                        end_time=0,
-                        language=self.language,
-                    )
-                ],
-            )
-
-        '''
-        #==============================================================================================================================================================
-        # for WebSocket API
-        lang = (
-            language
-            if language is not NOT_GIVEN
-            else self.language
+        conn_options: APIConnectOptions | None = None,
+    ) -> "GrokSTTStream":
+        """LiveKit calls this to get a streaming session."""
+        lang = language if language is not NOT_GIVEN else self.language
+        return GrokSTTStream(
+            stt=self,
+            language=lang,
+            conn_options=conn_options or APIConnectOptions(),
         )
+
+
+class GrokSTTStream(stt.SpeechStream):
+    """
+    Streaming STT session.
+
+    Flow:
+    1. LiveKit pushes AudioFrames via push_frame()
+    2. We forward raw PCM bytes to xAI WebSocket continuously
+    3. xAI sends back transcript.partial events as user speaks
+    4. When xAI sends speech_final=True we emit FINAL_TRANSCRIPT
+    5. LiveKit triggers the LLM immediately — no VAD delay
+    """
+
+    def __init__(
+        self,
+        *,
+        stt: GrokSTT,
+        language: str,
+        conn_options: APIConnectOptions,
+    ):
+        super().__init__(
+            stt=stt,
+            conn_options=conn_options,
+        )
+        self._stt = stt
+        self._language = language
+
+    async def _run(self) -> None:
+        """Main streaming loop — runs for the lifetime of the session."""
 
         ws_url = (
             f"wss://api.x.ai/v1/stt"
-            f"?language={lang}"
-            f"&format=true"
         )
 
-        async with websockets.connect(
-            ws_url,
-            additional_headers={
-                "Authorization": f"Bearer {self.api_key}"
-            }
-        ) as ws:
-        
-            await ws.send(audio_bytes)
+        try:
+            async with websockets.connect(
+                ws_url,
+                additional_headers={
+                    "Authorization": f"Bearer {self._stt.api_key}"
+                },
+                ping_interval=20,
+                ping_timeout=10,
+            ) as ws:
 
-            await ws.send(json.dumps({
-                "type": "audio.done"
-            }))
+                logger.info("GrokSTT WebSocket connected")
 
-            text = ""
+                # Run sender and receiver concurrently
+                await asyncio.gather(
+                    self._send_audio(ws),
+                    self._recv_transcripts(ws),
+                )
 
-            while True:
+        except websockets.exceptions.ConnectionClosedError as e:
+            logger.warning(f"GrokSTT WebSocket closed: {e}")
+        except Exception as e:
+            logger.error(f"GrokSTT stream error: {e}")
 
-                response = await ws.recv()
+    async def _send_audio(self, ws) -> None:
+        """
+        Read AudioFrames from LiveKit and send PCM bytes to xAI.
+        LiveKit pushes frames via the input channel (_input_ch).
+        """
+        try:
+            async for frame in self._input_ch:
 
-                result = json.loads(response)
+                # End of stream signal
+                if frame is None:
+                    logger.info("GrokSTT: end of audio stream")
+                    await ws.send(json.dumps({"type": "audio.done"}))
+                    break
 
-                print("WebSocket Response:", result)
+                if not isinstance(frame, rtc.AudioFrame):
+                    continue
 
+                # Resample to 16kHz if needed (xAI expects 16kHz)
+                audio_data = np.frombuffer(frame.data, dtype=np.int16)
+
+                if frame.sample_rate != 16000:
+                    # Simple resample by decimation/interpolation
+                    ratio = 16000 / frame.sample_rate
+                    new_length = int(len(audio_data) * ratio)
+                    indices = np.linspace(0, len(audio_data) - 1, new_length)
+                    audio_data = np.interp(
+                        indices,
+                        np.arange(len(audio_data)),
+                        audio_data
+                    ).astype(np.int16)
+
+                # Send raw PCM bytes
+                await ws.send(audio_data.tobytes())
+
+        except Exception as e:
+            logger.error(f"GrokSTT send error: {e}")
+
+    async def _recv_transcripts(self, ws) -> None:
+        """
+        Receive transcript events from xAI and emit to LiveKit.
+        """
+        try:
+            async for message in ws:
+                result = json.loads(message)
                 event_type = result.get("type", "")
 
-                # transcript event
                 if event_type == "transcript.partial":
+                    text = result.get("text", "").strip()
+                    is_final = result.get("is_final", False)
+                    speech_final = result.get("speech_final", False)
 
-                    print("PARTIAL:", result)
+                    if not text:
+                        continue
 
-                    # xAI marks final transcript here
-                    if result.get("is_final", False):
+                    logger.debug(f"GrokSTT partial: '{text}' "
+                                f"is_final={is_final} "
+                                f"speech_final={speech_final}")
 
-                        text = result.get("text", "").strip()
+                    if speech_final:
+                        # User finished speaking — emit final transcript
+                        # LiveKit will immediately trigger LLM
+                        self._event_ch.send_nowait(
+                            stt.SpeechEvent(
+                                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                                alternatives=[
+                                    stt.SpeechData(
+                                        text=text,
+                                        start_time=0,
+                                        end_time=0,
+                                        language=self._language,
+                                    )
+                                ],
+                            )
+                        )
+                        logger.info(f"GrokSTT FINAL: '{text}'")
 
-                        break
+                    elif is_final or text:
+                        # Interim result — show as user speaks
+                        self._event_ch.send_nowait(
+                            stt.SpeechEvent(
+                                type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                                alternatives=[
+                                    stt.SpeechData(
+                                        text=text,
+                                        start_time=0,
+                                        end_time=0,
+                                        language=self._language,
+                                    )
+                                ],
+                            )
+                        )
 
-            text = result.get("text", "").strip()
+                elif event_type == "transcript.done":
+                    text = result.get("text", "").strip()
+                    if text:
+                        self._event_ch.send_nowait(
+                            stt.SpeechEvent(
+                                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                                alternatives=[
+                                    stt.SpeechData(
+                                        text=text,
+                                        start_time=0,
+                                        end_time=0,
+                                        language=self._language,
+                                    )
+                                ],
+                            )
+                        )
 
-            return stt.SpeechEvent(
-                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                alternatives=[
-                    stt.SpeechData(
-                        text=text,
-                        start_time=0,
-                        end_time=0,
-                        language=self.language,
-                    )
-                ],
-            )
+                elif event_type == "error":
+                    logger.error(f"GrokSTT error from xAI: {result}")
 
+        except websockets.exceptions.ConnectionClosedError:
+            pass
+        except Exception as e:
+            logger.error(f"GrokSTT recv error: {e}")

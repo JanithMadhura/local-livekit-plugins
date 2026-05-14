@@ -28,6 +28,8 @@ import time
 import asyncio
 import random
 
+from transformers import pipeline as hf_pipeline
+
 # Add parent directory to path for local development
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -57,6 +59,73 @@ logging.basicConfig(
     format="%(asctime)s | %(name)-20s | %(levelname)-8s | %(message)s"
 )
 logger = logging.getLogger("voice-agent-optimized")
+
+# =============================================================================
+# Emotion Classifier
+# =============================================================================
+emotion_classifier = hf_pipeline(
+    "text-classification",
+    model="SamLowe/roberta-base-go_emotions",
+    top_k=1,
+    device=-1,  # CPU; change to 0 for GPU
+)
+
+intent_classifier = hf_pipeline(
+    "text-classification",
+    model="Wyona/message-classification-question-other-smalltalk-modified",
+    top_k=1,
+    device=-1,
+)
+
+def detect_intent(text: str) -> str:
+    """Detect intent: question / smalltalk / other"""
+    try:
+        result = intent_classifier(text)
+        label = result[0][0]["label"].lower()
+        score = result[0][0]["score"]
+        logger.info(f"Intent: {label} (confidence: {score:.2f})")
+        if score < 0.65:
+            return "other"
+        return label
+    except Exception as e:
+        logger.warning(f"Intent detection failed: {e}")
+        return "other"
+
+def detect_emotion(text: str) -> str:
+    try:
+        result = emotion_classifier(text)
+        label = result[0][0]["label"].lower()
+        score = result[0][0]["score"]
+
+        logger.info(f"Emotion: {label} (confidence: {score:.2f})")
+
+        if score < 0.70:
+            return "neutral"
+
+        # Map GoEmotions 28 labels down to your 7 filler categories
+        positive = {"joy", "amusement", "approval", "excitement", "gratitude", "love", "optimism", "relief", "pride", "admiration", "desire", "caring"}
+        negative_sad = {"sadness", "grief", "remorse", "disappointment"}
+        negative_angry = {"anger", "annoyance", "disapproval"}
+        scared = {"fear", "nervousness"}
+        surprised = {"surprise"}
+
+        if label in positive:
+            return "joy"
+        elif label in negative_sad:
+            return "sadness"
+        elif label in negative_angry:
+            return "anger"
+        elif label in scared:
+            return "fear"
+        elif label in surprised:
+            return "surprise"
+        else:
+            return "neutral"
+
+    except Exception as e:
+        logger.warning(f"Emotion detection failed: {e}")
+        return "neutral"
+        
 logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 logging.getLogger("local_livekit_plugins").setLevel(logging.WARNING)
 logging.getLogger("livekit").setLevel(logging.WARNING)
@@ -77,7 +146,7 @@ WHISPER_COMPUTE_TYPE = os.getenv(
 )
 WHISPER_MAX_AUDIO_SECONDS = float(os.getenv("WHISPER_MAX_AUDIO_SECONDS", "0.0"))
 WHISPER_VAD_FILTER = os.getenv("WHISPER_VAD_FILTER", "false").lower() == "true"
-FINALIZE_SILENCE_SECONDS = float(os.getenv("FINALIZE_SILENCE_SECONDS", "0.5"))
+FINALIZE_SILENCE_SECONDS = float(os.getenv("FINALIZE_SILENCE_SECONDS", "1.5"))
 MIN_FINAL_TRANSCRIPT_CHARS = int(os.getenv("MIN_FINAL_TRANSCRIPT_CHARS", "2"))
 
 # TTS: Streaming with 1.5x speed for lower latency
@@ -89,7 +158,7 @@ PIPER_USE_CUDA = os.getenv("PIPER_USE_CUDA", "false").lower() == "true"
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3")  # use `ollama list` for installed names
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "25"))
-EARLY_TTS_WORDS = max(1, int(os.getenv("EARLY_TTS_WORDS", "3")))
+EARLY_TTS_WORDS = max(1, int(os.getenv("EARLY_TTS_WORDS", "2")))
 MAX_TTS_WORDS = max(EARLY_TTS_WORDS, int(os.getenv("MAX_TTS_WORDS", "20")))
 
 
@@ -153,11 +222,11 @@ def create_optimized_local_session() -> AgentSession:
 
     turn_detector = MultilingualModel()
     stt_vad = silero.VAD.load(
-        min_speech_duration=0.25,
-        min_silence_duration=1.0,
-        prefix_padding_duration=0.1,
+        min_speech_duration=0.3,
+        min_silence_duration=1.8,
+        prefix_padding_duration=0.3,
         max_buffered_speech=8.0,
-        activation_threshold=0.15,
+        activation_threshold=0.20,
     )
 
     if not PIPER_MODEL_PATH:
@@ -342,107 +411,165 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         """
         generated_chars = 0
         emitted_words = 0
+        first_llm_token_received = False
         tts_queue = asyncio.Queue()
 
         nonlocal _agent_speaking
         nonlocal _current_speech_handle
         nonlocal _interrupt_requested
 
+
         logger.info(f"Streaming response for: {user_text}")
 
-        fillers = {
-            "question": [
-                "Good question.",
-                "Interesting.",
-                "Let me think.",
-            ],
+        # fillers = {
+        #     "question": [
+        #         "Good question.",
+        #         "Interesting.",
+        #         "Let me think.",
+        #     ],
 
-            "explanation": [
-                "Alright.",
-                "Okay.",
-                "Let me explain.",
-            ],
+        #     "explanation": [
+        #         "Alright.",
+        #         "Okay.",
+        #         "Let me explain.",
+        #     ],
 
-            "default": [
-                "Okay.",
-                "Sure.",
-            ]
+        #     "default": [
+        #         "Okay.",
+        #         "Sure.",
+        #     ]
+        # }
+
+        # def detect_filler_type(user_text: str):
+
+        #     text = user_text.lower()
+
+        #     # explanation / learning
+        #     if any(word in text for word in [
+        #         "explain",
+        #         "why",
+        #         "how",
+        #         "teach",
+        #         "what is",
+        #     ]):
+        #         return "explanation"
+
+        #     # question
+        #     if "?" in text:
+        #         return "question"
+
+        #     return "default"
+
+        EMOTION_FILLERS = {
+            # Emotion-based
+            "joy":          ["Great!", "Love that!", "Awesome!"],
+            "sadness":      ["I understand.", "That sounds hard.", "I hear you."],
+            "anger":        ["Fair point.", "I get that.", "Let me help."],
+            "fear":         ["It's okay.", "No worries.", "You're safe."],
+            "surprise":     ["Wow!", "No way!", "That's wild!"],
+
+            # Intent-based (for neutral emotion)
+            "smalltalk":    ["Hey there.", "Hi there!"],
+            "question":     ["Interesting question. Let me think for a second."],
+            "other":        ["Alright.", "Got it.", "Sure."],
         }
 
-        def detect_filler_type(user_text: str):
 
-            text = user_text.lower()
+        def get_emotion_filler(user_text: str) -> str:
+            # Stage 1 — check emotion
+            emotion = detect_emotion(user_text)
+            logger.info(f"DETECTED EMOTION: {emotion}")
 
-            # explanation / learning
-            if any(word in text for word in [
-                "explain",
-                "why",
-                "how",
-                "teach",
-                "what is",
-            ]):
-                return "explanation"
+            if emotion != "neutral":
+                return random.choice(EMOTION_FILLERS.get(emotion, EMOTION_FILLERS["other"]))
 
-            # question
-            if "?" in text:
-                return "question"
+            # Stage 2 — greeting check BEFORE intent classifier
+            text = user_text.lower().strip()
+            greetings = ["how are you", "how are u", "hey", "hi ", "hello", "what's up", "whats up"]
+            if any(g in text for g in greetings):
+                logger.info("DETECTED INTENT: smalltalk (greeting)")
+                return random.choice(EMOTION_FILLERS["smalltalk"])
 
-            return "default"
+            # Stage 3 — intent classifier
+            intent = detect_intent(user_text)
+            logger.info(f"DETECTED INTENT: {intent}")
+            return random.choice(EMOTION_FILLERS.get(intent, EMOTION_FILLERS["other"]))
+                # async def play_filler():
+
+        #     try:
+
+        #         filler_type = detect_filler_type(user_text)
+
+        #         selected_filler = random.choice(
+        #             fillers[filler_type]
+        #         )
+
+        #         logger.info(
+        #             f"Selected filler: {selected_filler}"
+        #         )
+
+        #         await session.say(
+        #             selected_filler,
+        #             add_to_chat_ctx=False,
+        #         )
+
+        #     except Exception as e:
+
+        #         logger.warning(f"Filler playback failed: {e}")
+
+        def clean_llm_output(text: str) -> str:
+            """Strip phi3 training artifacts and markdown from LLM output."""
+            import re
+            # Cut at the first --- or ** (phi3 instruction bleed)
+            text = re.split(r'---|^\*\*|\*\*', text)[0]
+            # Remove surrounding quotes
+            text = text.strip().strip('"').strip("'")
+            # Remove markdown bold/italic/headers
+            text = re.sub(r'[*#`]+', '', text)
+            # Collapse whitespace
+            text = ' '.join(text.split())
+            return text.strip()
 
         async def play_filler():
-
             try:
+                selected_filler = get_emotion_filler(user_text)
+                logger.info(f"Selected filler: {selected_filler}")
+                # Put filler as FIRST item in tts_queue
+                # tts_worker will speak it before anything else
+                await tts_queue.put(selected_filler)
 
-                filler_type = detect_filler_type(user_text)
-
-                selected_filler = random.choice(
-                    fillers[filler_type]
-                )
-
-                logger.info(
-                    f"Selected filler: {selected_filler}"
-                )
-
-                await session.say(
-                    selected_filler,
-                    add_to_chat_ctx=False,
-                )
-
+                await asyncio.sleep(0.05)
             except Exception as e:
-
                 logger.warning(f"Filler playback failed: {e}")
+
+        # delayed_filler removed — filler is now triggered exclusively
+        # when the first LLM token arrives (EARLY_TTS word-count gate).
 
         async def tts_worker():
             nonlocal _current_speech_handle
-            nonlocal filler_task
 
             while True:
-
                 chunk = await tts_queue.get()
 
                 if chunk is None:
+                    tts_queue.task_done()
                     break
 
                 if _interrupt_requested:
-                    logger.info(f"Dropping queued TTS chunk after interruption: {chunk}")
+                    logger.info(f"Dropping TTS chunk: {chunk}")
                     tts_queue.task_done()
                     continue
 
                 try:
-                    _current_speech_handle = session.say(
-                        chunk,
-                        add_to_chat_ctx=False,
-                    )
-                    await _current_speech_handle
-
-                    await asyncio.sleep(0.15)  # allow some time for the speech to start before processing next chunk
-
+                    logger.info(f"TTS SPEAKING: {chunk}")
+                    handle = session.say(chunk, add_to_chat_ctx=False)
+                    _current_speech_handle = handle
+                    await handle  # ← wait for THIS chunk to fully finish
+                    await asyncio.sleep(0.05)  # tiny gap between chunks
                 except Exception as e:
                     logger.warning(f"TTS worker error: {e}")
                 finally:
                     _current_speech_handle = None
-
-                    # safe speaking reset
                     _agent_speaking = False
 
                 tts_queue.task_done()
@@ -471,7 +598,6 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
         # This manual streaming loop allows us to push tokens into TTS as they arrive, without waiting for the full response.
         filler_played = False
-        filler_task = None
 
         try:
             async with session.llm.chat(
@@ -489,6 +615,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                         continue
 
                     token = chunk.delta.content
+
+                    if not first_llm_token_received:
+
+                        first_llm_token_received = True
 
                     generated_chars += len(token)
 
@@ -512,52 +642,52 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                     # Ollama/LiveKit deltas can be large. Split them here so TTS
                     # sees tiny chunks even when the upstream stream is buffered.
                     parts = current_sentence.split()
+                    words = current_sentence.strip().split()
+
+                    # Trigger filler on very first LLM token, before any TTS emission.
+                    if (
+                        not filler_played
+                        and not emitted_words
+                        and len(words) >= 1
+                        and not _interrupt_requested
+                    ):
+                        filler_played = True
+                        logger.info("Speaking filler FIRST")
+
+                        selected_filler = get_emotion_filler(user_text)
+
+                        logger.info(f"Selected filler: {selected_filler}")
+
+                        # Send filler through SAME TTS worker
+                        await tts_queue.put(selected_filler)
+
+                        # Give filler time to play first
+                        await asyncio.sleep(0.3)# Give filler some breathing room before TTS starts
 
                     # Do not wait for the full word chunk when the model has
                     # already produced a clean short acknowledgement.
                     if (
                         parts
                         and len(parts) < EARLY_TTS_WORDS
-                        and current_sentence.strip().endswith((".", "!", "?", ",", ";", ":"))
+                        and current_sentence.strip().endswith((".", "!", "?", ";", ":"))
                         and emitted_words < MAX_TTS_WORDS
                         and not _interrupt_requested
                     ):
                         remaining_words = MAX_TTS_WORDS - emitted_words
                         words_to_emit = min(len(parts), remaining_words)
-                        chunk_text = " ".join(parts[:words_to_emit])
+                        chunk_text = clean_llm_output(" ".join(parts[:words_to_emit]))
 
-                        logger.info(f"EARLY TTS: {chunk_text}")
-
-                        _agent_speaking = True
-
-                        await tts_queue.put(chunk_text)
-
-                        await asyncio.sleep(0.15)
-
-                        # soft limit only
-                        if emitted_words >= MAX_TTS_WORDS:
-                            logger.info("Reached soft word target")
-
-                        emitted_words += words_to_emit
-                        parts = parts[words_to_emit:]
+                        if chunk_text:
+                            logger.info(f"EARLY TTS: {chunk_text}")
+                            _agent_speaking = True
+                            await tts_queue.put(chunk_text)
+                            await asyncio.sleep(0.15)
+                            if emitted_words >= MAX_TTS_WORDS:
+                                logger.info("Reached soft word target")
+                            emitted_words += words_to_emit
+                            parts = parts[words_to_emit:]
 
                     words = current_sentence.strip().split()
-
-                    # decide filler BEFORE first TTS
-                    if (
-                        not filler_played
-                        and not emitted_words
-                        and len(words) >= EARLY_TTS_WORDS
-                        and not _interrupt_requested
-                    ):
-
-                        filler_played = True
-
-                        logger.info("Speaking filler FIRST")
-
-                        await play_filler()
-
-                        logger.info("Filler finished")
 
                     should_emit = (
                         len(words) >= EARLY_TTS_WORDS
@@ -573,31 +703,26 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                         and not _interrupt_requested
                     ):
 
-                        chunk_text = current_sentence.strip()
+                        chunk_text = clean_llm_output(current_sentence.strip())
 
-                        logger.info(f"EARLY TTS: {chunk_text}")
-
-                        _agent_speaking = True
-
-                        await tts_queue.put(chunk_text)
-
-                        # soft limit only
-                        if emitted_words >= MAX_TTS_WORDS:
-                            logger.info("Reached soft word target")
-
-                        emitted_words += len(words)
+                        if chunk_text:
+                            logger.info(f"EARLY TTS: {chunk_text}")
+                            _agent_speaking = True
+                            await tts_queue.put(chunk_text)
+                            if emitted_words >= MAX_TTS_WORDS:
+                                logger.info("Reached soft word target")
+                            emitted_words += len(words)
 
                         current_sentence = ""
                         parts = []
 
                     current_sentence = " ".join(parts)
 
-                    
         except Exception as e:
             logger.exception(f"LLM stream failed: {e}")
 
         # leftover partial sentence
-        leftover_text = current_sentence.strip()
+        leftover_text = clean_llm_output(current_sentence.strip())
 
         # ignore tiny leftovers
         if len(leftover_text.split()) < 2:
@@ -615,8 +740,6 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 logger.info(f"EARLY TTS: {chunk_text}")
                 _agent_speaking = True
                 await tts_queue.put(chunk_text)
-
-                # soft limit only
                 if emitted_words >= MAX_TTS_WORDS:
                     logger.info("Reached soft word target")
 
