@@ -196,7 +196,139 @@ class OptimizedVoiceAssistant(Agent):
         )
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
-        """Stop LiveKit's automatic reply; the manual stream handles TTS."""
+        """Normalize the final user message, invoke the streaming handler, then stop the default reply.
+
+        This runs the filler immediately and starts LLM streaming without waiting for the transcript monitor.
+        """
+        # Extract text from the message (may be string/object/list)
+        raw = new_message.content if hasattr(new_message, "content") else new_message
+
+        if isinstance(raw, list):
+            parts: list[str] = []
+            for item in raw:
+                if item is None:
+                    continue
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and "content" in item:
+                    parts.append(str(item.get("content", "")))
+                elif hasattr(item, "content"):
+                    parts.append(str(item.content))
+                else:
+                    parts.append(str(item))
+            user_text = " ".join(p for p in (p.strip() for p in parts) if p)
+        else:
+            user_text = str(raw).strip()
+
+        handler = getattr(self.session, "_stream_llm_to_tts", None)
+        # Optionally require end-of-utterance confirmation from the turn detector
+        eou_threshold = float(os.getenv("EOU_THRESHOLD", "0.05"))
+        if handler and user_text:
+            try:
+                td = getattr(self.session, "turn_detection", None)
+                if td is not None:
+                    # Debug: inspect what is being passed to the turn detector.
+                    # Attempt to extract ChatContext messages (role/content) so we
+                    # can compare the exact input the model sees.
+                    try:
+                        logger.debug("Turn detector context repr: %r", turn_ctx)
+
+                        msgs = None
+                        if hasattr(turn_ctx, "items"):
+                            msgs = turn_ctx.items
+
+                        if msgs is not None:
+                            for i, m in enumerate(msgs):
+                                try:
+                                    role = getattr(m, "role", None)
+                                    text = None
+                                    if hasattr(m, "text_content"):
+                                        text = m.text_content
+                                    elif hasattr(m, "content"):
+                                        # content is a list; join strings for logging
+                                        try:
+                                            text_parts = [c for c in m.content if isinstance(c, str)]
+                                            text = "\n".join(text_parts) if text_parts else None
+                                        except Exception:
+                                            text = repr(m.content)
+
+                                    logger.debug("TD msg %d: role=%r text=%r", i, role, text)
+                                except Exception:
+                                    logger.debug("TD msg %d raw: %r", i, m)
+                        else:
+                            # Fallback: log string conversion (trimmed)
+                            try:
+                                s = str(turn_ctx)
+                                logger.debug("turn_ctx str (trim): %r", s[:200])
+                            except Exception:
+                                logger.debug("Unable to stringify turn_ctx")
+                    except Exception:
+                        logger.debug("Unable to introspect turn_ctx for TD input")
+
+                    try:
+                        # Ensure the turn-detector sees the final user message.
+                        # Some callers pass a ChatContext that only contains the assistant
+                        # state; append the user's final transcript so the model has
+                        # both assistant+user context (matching the plugin's own
+                        # internal calls that produced the higher score).
+                        try:
+                            probe_ctx = turn_ctx.copy()
+                        except Exception:
+                            probe_ctx = ChatContext()
+
+                        try:
+                            probe_ctx.add_message(role="user", content=user_text)
+                        except Exception:
+                            # best-effort: if add_message isn't available, ignore
+                            pass
+
+                        # Initial check
+                        prob = await td.predict_end_of_turn(probe_ctx, timeout=1.0)
+                        logger.info("EOU prob: %.3f (threshold: %.3f)", prob, eou_threshold)
+
+                        # If below threshold, poll a few times (short window) to wait
+                        # for a more complete transcript or updated model state.
+                        if prob < eou_threshold:
+                            poll_timeout = float(os.getenv("EOU_POLL_TIMEOUT", "3.0"))
+                            poll_interval = float(os.getenv("EOU_POLL_INTERVAL", "0.1"))
+                            start_t = time.perf_counter()
+                            logger.debug("EOU below threshold, polling up to %.2fs", poll_timeout)
+                            while time.perf_counter() - start_t < poll_timeout:
+                                await asyncio.sleep(poll_interval)
+                                try:
+                                    # try to refresh probe_ctx with any updated context
+                                    try:
+                                        updated = turn_ctx.copy()
+                                        probe_ctx = updated
+                                        probe_ctx.add_message(role="user", content=user_text)
+                                    except Exception:
+                                        pass
+
+                                    prob = await td.predict_end_of_turn(probe_ctx, timeout=0.5)
+                                    logger.info("EOU poll prob: %.3f", prob)
+                                    if prob >= eou_threshold:
+                                        break
+                                except Exception as e:
+                                    logger.debug("EOU poll failed: %s", e)
+
+                            if prob < eou_threshold:
+                                logger.info("EOU below threshold after polling; forcing response due to timeout")
+                                # Do NOT raise StopResponse here — the poll window
+                                # expired but we still want to respond. Continue
+                                # to the streaming handler below.
+                    except StopResponse:
+                        raise
+                    except Exception as e:
+                        logger.warning("EOU check failed, proceeding: %s", e)
+
+                await handler(self.session, user_text)
+            except StopResponse:
+                # expected control-flow to stop the default reply
+                raise
+            except Exception:
+                logger.exception("stream handler failed in on_user_turn_completed")
+
+        # Prevent LiveKit's default reply; we've handled the turn.
         raise StopResponse()
 
 
@@ -237,15 +369,15 @@ def create_optimized_local_session() -> AgentSession:
 
     return AgentSession(
         # STT: Streaming-capable whisper with VAD-based chunking
-        #stt=FasterWhisperSTT(
+        # stt=FasterWhisperSTT(
         #    model_size=WHISPER_MODEL,
         #    device=WHISPER_DEVICE,
         #    compute_type=WHISPER_COMPUTE_TYPE,  # Quantized for speed
         #    vad_filter=WHISPER_VAD_FILTER,
         #    streaming=False,  # Enable streaming mode
-        #   vad=stt_vad,
+        #    vad=stt_vad,
         #    max_audio_seconds=WHISPER_MAX_AUDIO_SECONDS,
-        #), 
+        # ), 
 
         stt=GrokSTT(
             api_key=os.getenv("GROK_API_KEY_STT"),
@@ -275,6 +407,14 @@ def create_optimized_local_session() -> AgentSession:
         # ),
         vad=stt_vad,
         turn_detection=turn_detector,
+        # Endpointing and interruption tuning (floats/ints expected)
+        min_endpointing_delay=0.5,
+        max_endpointing_delay=3.0,
+        min_interruption_duration=0.5,
+        min_interruption_words=0,
+        # Disable speculative preemptive generation and automatic interruptions
+        preemptive_generation=False,
+        allow_interruptions=False,
     )
 
 
@@ -300,25 +440,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     _first_audio_time: float | None = None
     _stt_start_time: float | None = None
 
-    # Transcript stabilization state
-    _partial_transcript = ""
-    _last_speech_time = time.perf_counter()
-    _user_speaking = False
-    _eou_probability = 0.0
-    _agent_speaking = False
-    _current_speech_handle = None
-    _interrupt_requested = False
-
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(ev) -> None:
         nonlocal _transcription_time
         nonlocal _stt_start_time
         nonlocal _chunk_count
         nonlocal _first_audio_time
-        nonlocal _partial_transcript
-
-        # ignore assistant echo
-        
 
         _transcription_time = time.perf_counter()
         _chunk_count = 0
@@ -329,63 +456,14 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             _stt_start_time = time.perf_counter()
 
         if text:
-            # Merge partial transcript progressively
-            _partial_transcript = text
-
-        logger.info(f"PARTIAL: {_partial_transcript}")
-
-    @session.on("user_started_speaking")
-    def on_user_started_speaking():
-        nonlocal _user_speaking
-        nonlocal _agent_speaking
-        nonlocal _partial_transcript
-        nonlocal _current_speech_handle
-        nonlocal _interrupt_requested
-        logger.info(f"Agent speaking state: {_agent_speaking}")
-        logger.info("VAD DETECTED SPEECH")
-
-        _user_speaking = True
-
-        # User interrupted assistant speech
-        # only interrupt on REAL transcript
-        if (
-            _agent_speaking
-            and len(_partial_transcript.strip().split()) >= 2
-        ):
-
-            logger.info("Real user interruption detected")
-
-            _interrupt_requested = True
-
-            # cancel current speech
-            if _current_speech_handle:
-                try:
-                    _current_speech_handle.interrupt(force=True)
-                    logger.info("Current speech cancelled")
-                except Exception as e:
-                    logger.warning(f"Speech cancel failed: {e}")
-
-    @session.on("user_stopped_speaking")
-    def on_user_stopped_speaking():
-        nonlocal _user_speaking, _last_speech_time
-        _user_speaking = False
-        _last_speech_time = time.perf_counter()
-        logger.debug("User stopped speaking")
+            logger.info(f"PARTIAL: {text}")
 
     @session.on("agent_state_changed")
     def on_agent_state_changed(ev) -> None:
         nonlocal _transcription_time
         nonlocal _first_audio_time
-        nonlocal _agent_speaking
-        nonlocal _partial_transcript
-
 
         if ev.new_state == "speaking":
-            _agent_speaking = True
-
-            # Reset transcript state when AI starts speaking
-            _partial_transcript = ""
-
             if _transcription_time is not None:
                 _first_audio_time = time.perf_counter()
 
@@ -405,6 +483,16 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         if ev.new_state == "speaking":
             print("TTS started - LLM streaming is working!")
 
+    @session.on("metrics_collected")
+    def on_metrics(ev):
+        metrics = ev.metrics if hasattr(ev, "metrics") else ev
+
+        # LiveKit turn detector metrics
+        if hasattr(metrics, "eou_probability"):
+            logger.info(
+                f"EOU UPDATED: {metrics.eou_probability:.3f}"
+            )
+
     async def stream_llm_to_tts(session, user_text):
         """
         Stream Ollama tokens directly into TTS sentence-by-sentence.
@@ -414,10 +502,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         first_llm_token_received = False
         tts_queue = asyncio.Queue()
 
-        nonlocal _agent_speaking
-        nonlocal _current_speech_handle
-        nonlocal _interrupt_requested
-
+        # Internal interrupt flag — set by the tts_worker on cancellation
+        _interrupt_requested = False
+        _agent_speaking = False
+        _current_speech_handle = None
 
         logger.info(f"Streaming response for: {user_text}")
 
@@ -470,7 +558,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
             # Intent-based (for neutral emotion)
             "smalltalk":    ["Hey there.", "Hi there!"],
-            "question":     ["Interesting question. Let me think for a second."],
+            "question":     ["Interesting question.", "Let me think about that.", "Let me think for a moment."],
             "other":        ["Alright.", "Got it.", "Sure."],
         }
 
@@ -545,8 +633,14 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         # delayed_filler removed — filler is now triggered exclusively
         # when the first LLM token arrives (EARLY_TTS word-count gate).
 
+        # Event set when the filler finishes playing.
+        # The LLM loop awaits this before releasing any LLM-generated chunks,
+        # so the filler always plays fully before the real response starts.
+        filler_done_event = asyncio.Event()
+        filler_done_event.set()  # default: no filler pending, nothing to wait for
+
         async def tts_worker():
-            nonlocal _current_speech_handle
+            first_chunk = True
 
             while True:
                 chunk = await tts_queue.get()
@@ -558,34 +652,63 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 if _interrupt_requested:
                     logger.info(f"Dropping TTS chunk: {chunk}")
                     tts_queue.task_done()
+                    # Unblock LLM loop even on interrupt
+                    filler_done_event.set()
+                    first_chunk = False
                     continue
 
                 try:
+
                     logger.info(f"TTS SPEAKING: {chunk}")
                     handle = session.say(chunk, add_to_chat_ctx=False)
                     _current_speech_handle = handle
-                    await handle  # ← wait for THIS chunk to fully finish
+                    await handle  # wait for THIS chunk to fully finish
                     await asyncio.sleep(0.05)  # tiny gap between chunks
                 except Exception as e:
                     logger.warning(f"TTS worker error: {e}")
                 finally:
                     _current_speech_handle = None
-                    _agent_speaking = False
+                    # Signal filler done after the FIRST chunk (the filler) finishes.
+                    # Subsequent LLM chunks are already unblocked at this point.
+                    if first_chunk:
+                        filler_done_event.set()
+                        first_chunk = False
 
                 tts_queue.task_done()
 
-        # Start TTS worker
-        worker_task = asyncio.create_task(tts_worker())
+            # Only clear agent_speaking once the ENTIRE queue has drained.
+            _agent_speaking = False
 
+        # Detect filler synchronously FIRST (it's a regular function, not async).
+        # This means selected_filler is known immediately — no blocking needed —
+        # so we can embed it in the system prompt AND queue it for TTS at the same time.
+        selected_filler = get_emotion_filler(user_text)
+        logger.info(f"Selected filler: {selected_filler}")
+
+        # Build ctx NOW, while filler is queued but not yet playing.
+        # The LLM stream won't open until after this, so there's no race.
         ctx = ChatContext()
         ctx.add_message(
             role="system",
             content=(
                 "Reply naturally in one short sentence. "
                 "Maximum 10 words. "
-                "Never give long explanations."
+                "Never give long explanations. "
+                f'You already said "{selected_filler}" as an acknowledgement — '
+                "do NOT repeat it or start with any greeting. "
+                "Go straight to answering."
             )
         )
+
+        # Start TTS worker and queue filler — runs concurrently with LLM stream below.
+        # filler_done_event ensures LLM chunks don't enter the queue until filler finishes.
+        worker_task = asyncio.create_task(tts_worker())
+        filler_done_event.clear()
+        _agent_speaking = True
+        await tts_queue.put(selected_filler)
+        # No blocking wait here — the filler plays concurrently while the LLM warms up.
+        # tts_worker will set filler_done_event when filler finishes, which gates
+        # any LLM chunks from entering the queue via the in-loop filler_done_event.wait().
 
         ctx.add_message(
             role="user",
@@ -597,7 +720,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         first_chunk_time: float | None = None
 
         # This manual streaming loop allows us to push tokens into TTS as they arrive, without waiting for the full response.
-        filler_played = False
+        filler_played = True   # already played eagerly above
 
         try:
             async with session.llm.chat(
@@ -644,25 +767,14 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                     parts = current_sentence.split()
                     words = current_sentence.strip().split()
 
-                    # Trigger filler on very first LLM token, before any TTS emission.
-                    if (
-                        not filler_played
-                        and not emitted_words
-                        and len(words) >= 1
-                        and not _interrupt_requested
-                    ):
-                        filler_played = True
-                        logger.info("Speaking filler FIRST")
+                    # Filler is now played eagerly before the LLM stream opens,
+                    # so no in-loop trigger needed. filler_played=True already.
 
-                        selected_filler = get_emotion_filler(user_text)
-
-                        logger.info(f"Selected filler: {selected_filler}")
-
-                        # Send filler through SAME TTS worker
-                        await tts_queue.put(selected_filler)
-
-                        # Give filler time to play first
-                        await asyncio.sleep(0.3)# Give filler some breathing room before TTS starts
+                    # Gate: wait for filler to finish before pushing any LLM chunk.
+                    # This is a no-op if the filler already finished (event already set).
+                    # Only blocks on very fast LLMs where tokens arrive before filler ends.
+                    if not filler_done_event.is_set():
+                        await filler_done_event.wait()
 
                     # Do not wait for the full word chunk when the model has
                     # already produced a clean short acknowledgement.
@@ -754,6 +866,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         await worker_task
         
         _agent_speaking = False
+
+    # Register the streaming handler so the Agent class can reach it via session attribute
+    session._stream_llm_to_tts = stream_llm_to_tts
+
     # =========================================================================
     ## NOTE: The following WAV injection code is for testing and demonstration purposes.
     ## It simulates a user speaking from a pre-recorded audio file, allowing us to test the full pipeline (STT -> LLM -> TTS) with controlled input. In a
@@ -828,58 +944,6 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     #==================================================================================================
 
 
-    async def transcript_monitor():
-        nonlocal _partial_transcript
-        nonlocal _user_speaking
-        nonlocal _last_speech_time
-        nonlocal _stt_start_time
-
-        while True:
-            await asyncio.sleep(0.1)
-
-            if not _partial_transcript:
-                continue
-
-            silence_duration = time.perf_counter() - _last_speech_time
-            transcript = _partial_transcript.strip()
-            has_speech_text = (
-                len(transcript) >= MIN_FINAL_TRANSCRIPT_CHARS
-                and any(char.isalnum() for char in transcript)
-            )
-
-            # Finalize only if:
-            # - user stopped speaking
-            # - enough silence passed
-            should_finalize = (
-                not _user_speaking
-                and silence_duration > FINALIZE_SILENCE_SECONDS
-                and has_speech_text
-            )
-
-            if should_finalize:
-                final_text = transcript
-
-                if _stt_start_time is not None:
-
-                    stt_ms = (
-                        time.perf_counter() - _stt_start_time
-                    ) * 1000
-
-                    print(f"\nSTT TIME: {stt_ms:.0f}ms")
-
-                    _stt_start_time = None
-
-                logger.info(f"FINALIZED: {final_text}")
-
-                _partial_transcript = ""
-
-                nonlocal _current_speech_handle
-                nonlocal _interrupt_requested
-
-                _interrupt_requested = False 
-
-                await stream_llm_to_tts(session, final_text)
-
     # Start the agent session
     await session.start(
         room=ctx.room,
@@ -897,11 +961,6 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     await inject_wav_audio(session, wav_path)'''
     #=====================================================================================
-
-    asyncio.create_task(transcript_monitor())
-
-    # Send optimized greeting
-    
 
     logger.info("Agent ready - listening for speech...")
 

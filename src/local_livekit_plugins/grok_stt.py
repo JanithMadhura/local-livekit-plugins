@@ -26,7 +26,7 @@ class GrokSTT(stt.STT):
         super().__init__(
             capabilities=stt.STTCapabilities(
                 streaming=True,        # ← NOW streaming
-                interim_results=True,  # ← sends partials as user speaks
+                interim_results=False,  # ← sends partials as user speaks
             )
         )
 
