@@ -306,18 +306,6 @@ uv run mypy src/
 uv run pytest
 ```
 
-## Performance
-
-Tested on RTX 3060 12GB:
-
-| Component | Metric | Value |
-|-----------|--------|-------|
-| STT (whisper-medium) | Processing time | ~230-460ms |
-| STT (whisper-medium) | End-to-end (transcript_delay) | ~760ms avg |
-| TTS (piper ryan-high) | Per character | ~9ms |
-| TTS (piper ryan-high) | Short response (30 chars) | ~270ms |
-| TTS (piper ryan-high) | Long response (130 chars) | ~1200ms |
-
 **Note:** End-to-end latency includes VAD buffering. Local STT uses batch processing (waits for speech to end), while cloud STT streams in real-time.
 
 ## Known Issues
@@ -341,56 +329,5 @@ Tested on RTX 3060 12GB:
    - Containerize with a compatible CUDA version
    - See: [Piper CUDA 12 Discussion](https://github.com/rhasspy/piper/discussions/544)
 
-5. **No Streaming STT**: FasterWhisper uses batch processing - it waits for speech to end before transcribing. Cloud services like Deepgram stream audio in real-time, giving them a ~300ms latency advantage. This is a fundamental limitation of Whisper-based solutions.
-
-6. **Quality vs Cloud**: Local models are good but not as polished as cloud services like Deepgram or ElevenLabs.
-
-### Getting Help
-
-**Community Support:** This project is community-supported. For issues:
-- Check [existing GitHub issues](https://github.com/CoreWorxLab/local-livekit-plugins/issues)
-- Search for similar problems (especially platform-specific)
-- Open a new issue with your system info (OS, GPU, Python version, error logs)
-
-## Requirements
-
-- Python 3.10+
-- [uv](https://docs.astral.sh/uv/) (recommended) or pip
-- NVIDIA GPU with CUDA support (optional, for GPU acceleration)
-  - PyTorch is included as a dependency (~850MB) and provides bundled CUDA 12 libraries
-  - No separate CUDA toolkit installation required
-- ~2-4GB VRAM for Whisper medium model
-- ~500MB disk per Piper voice model
-
-## Related Projects
-
-- [LiveKit Agents](https://github.com/livekit/agents) - The framework these plugins integrate with
-- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) - CTranslate2 Whisper implementation
-- [Piper](https://github.com/rhasspy/piper) - Fast local neural TTS
-- [Ollama](https://ollama.ai/) - Local LLM server
-- [uv](https://docs.astral.sh/uv/) - Fast Python package manager
-
-## Contributing
-
-Contributions are welcome! This project is in active development and we'd love your help.
-
-**High Priority:**
-- **Platform testing**: Windows and Mac users - try it out and report what works/breaks
-- **GPU compatibility**: Test with different CUDA versions, AMD GPUs, or CPU-only setups
-- **Documentation**: Improve setup instructions, add troubleshooting tips
-
-**Also Welcome:**
-- Bug fixes and performance improvements
-- New features (open an issue first to discuss)
-- Better error messages and logging
-- Example projects and use cases
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines, or just open an issue to start a discussion!
-
-## License
-
-MIT License - see [LICENSE](LICENSE) for details.
-
----
 
 **Built with [Claude Code](https://claude.ai/claude-code)**
