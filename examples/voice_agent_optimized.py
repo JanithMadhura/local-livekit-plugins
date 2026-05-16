@@ -223,6 +223,20 @@ class OptimizedVoiceAssistant(Agent):
         handler = getattr(self.session, "_stream_llm_to_tts", None)
         # Optionally require end-of-utterance confirmation from the turn detector
         eou_threshold = float(os.getenv("EOU_THRESHOLD", "0.05"))
+
+        # Guard 1: currently mid-response (EOU fired, handler is running right now)
+        if getattr(self.session, "_is_responding", False):
+            logger.debug("on_user_turn_completed: already responding, skipping duplicate call")
+            raise StopResponse()
+
+        # Guard 2: this LiveKit-delivered transcript is a subset of what we already responded to.
+        # Happens when EOU fires early on "Maybe Let's do this." then LiveKit later delivers
+        # just "Let's do this." as the finalized segment — we must not respond again.
+        last_responded = getattr(self.session, "_last_responded_transcript", "")
+        if last_responded and user_text.strip().lower() in last_responded.strip().lower():
+            logger.debug("on_user_turn_completed: transcript %r already covered by %r, skipping", user_text, last_responded)
+            raise StopResponse()
+
         if handler and user_text:
             try:
                 td = getattr(self.session, "turn_detection", None)
@@ -282,50 +296,47 @@ class OptimizedVoiceAssistant(Agent):
                             # best-effort: if add_message isn't available, ignore
                             pass
 
-                        # Initial check
-                        prob = await td.predict_end_of_turn(probe_ctx, timeout=1.0)
-                        logger.info("EOU prob: %.3f (threshold: %.3f)", prob, eou_threshold)
-
-                        # If below threshold, poll a few times (short window) to wait
-                        # for a more complete transcript or updated model state.
-                        if prob < eou_threshold:
-                            poll_timeout = float(os.getenv("EOU_POLL_TIMEOUT", "3.0"))
-                            poll_interval = float(os.getenv("EOU_POLL_INTERVAL", "0.1"))
-                            start_t = time.perf_counter()
-                            logger.debug("EOU below threshold, polling up to %.2fs", poll_timeout)
-                            while time.perf_counter() - start_t < poll_timeout:
-                                await asyncio.sleep(poll_interval)
-                                try:
-                                    # try to refresh probe_ctx with any updated context
-                                    try:
-                                        updated = turn_ctx.copy()
-                                        probe_ctx = updated
-                                        probe_ctx.add_message(role="user", content=user_text)
-                                    except Exception:
-                                        pass
-
-                                    prob = await td.predict_end_of_turn(probe_ctx, timeout=0.5)
-                                    logger.info("EOU poll prob: %.3f", prob)
-                                    if prob >= eou_threshold:
-                                        break
-                                except Exception as e:
-                                    logger.debug("EOU poll failed: %s", e)
-
-                            if prob < eou_threshold:
-                                logger.info("EOU below threshold after polling; forcing response due to timeout")
-                                # Do NOT raise StopResponse here — the poll window
-                                # expired but we still want to respond. Continue
-                                # to the streaming handler below.
+                        # Wait until EOU probability reaches threshold (user finished speaking)
+                        # Use latest transcript that updates as user speaks
+                        while True:
+                            try:
+                                # Rebuild probe_ctx with latest turn_ctx AND latest transcript on each iteration
+                                probe_ctx = turn_ctx.copy()
+                                # Use the LIVE transcript that updates as user speaks
+                                current_text = self.session._latest_transcript if self.session._latest_transcript else user_text
+                                probe_ctx.add_message(role="user", content=current_text)
+                            except Exception:
+                                pass
+                            
+                            prob = await td.predict_end_of_turn(probe_ctx, timeout=1.0)
+                            # Print EOU updates in-place (same line)
+                            print(f"\rEOU prob: {prob:.3f} (threshold: {eou_threshold:.3f}) | {self.session._latest_transcript[:60]}", end="", flush=True)
+                            
+                            if prob >= eou_threshold:
+                                print()  # New line when threshold reached
+                                logger.info("EOU threshold reached (%.3f >= %.3f); responding now", prob, eou_threshold)
+                                # Always use the accumulated transcript — capture and reset atomically
+                                user_text = self.session._latest_transcript if self.session._latest_transcript else user_text
+                                self.session._last_responded_transcript = user_text  # Remember what we responded to
+                                self.session._latest_transcript = ""  # Reset now so next utterance starts clean
+                                break
+                            
+                            await asyncio.sleep(0.1)
                     except StopResponse:
                         raise
                     except Exception as e:
                         logger.warning("EOU check failed, proceeding: %s", e)
 
-                await handler(self.session, user_text)
+                self.session._is_responding = True
+                try:
+                    await handler(self.session, user_text)
+                finally:
+                    self.session._is_responding = False
             except StopResponse:
                 # expected control-flow to stop the default reply
                 raise
             except Exception:
+                self.session._is_responding = False
                 logger.exception("stream handler failed in on_user_turn_completed")
 
         # Prevent LiveKit's default reply; we've handled the turn.
@@ -439,6 +450,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
     _chunk_count = 0
     _first_audio_time: float | None = None
     _stt_start_time: float | None = None
+    session._latest_transcript = ""  # Track live transcript updates (store on session for accessibility)
+    session._is_responding = False   # Guard against double-firing on_user_turn_completed
+    session._last_responded_transcript = ""  # The accumulated text we already responded to
+    session._agent_finished_speaking = False  # Set when agent returns to listening; cleared on genuinely new input
 
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(ev) -> None:
@@ -452,6 +467,31 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         _first_audio_time = None
 
         text = ev.transcript.strip()
+
+        # If the agent just finished speaking AND the new transcript is NOT a
+        # subset of what we already responded to, it is genuinely new speech.
+        # Only then clear the dedup guard — not on the listening event, which
+        # fires before the STT delivers its final (potentially duplicate) segment.
+        if session._agent_finished_speaking and text:
+            last = session._last_responded_transcript.strip().lower()
+            if last and text.strip().lower() not in last:
+                session._last_responded_transcript = ""
+                logger.debug(
+                    "New speech detected after agent spoke; dedup guard cleared (%r not in %r)",
+                    text, last,
+                )
+            session._agent_finished_speaking = False
+
+        # Accumulate transcript instead of replacing it
+        # Only add if different from what we already have (avoid duplicates)
+        if text and text != session._latest_transcript:
+            if session._latest_transcript and not text.startswith(session._latest_transcript):
+                # New distinct speech segment, append it
+                session._latest_transcript += " " + text
+            else:
+                # First time or update to same sentence
+                session._latest_transcript = text
+        
         if _stt_start_time is None:
             _stt_start_time = time.perf_counter()
 
@@ -480,8 +520,36 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
     @session.on("agent_state_changed")
     def on_state_change(ev):
+
+        async def clear_stale_transcript():
+            await asyncio.sleep(0.5)
+
+            # If no new speech arrived after speaking ended,
+            # clear stale accumulation.
+            if session._agent_finished_speaking:
+                logger.debug(
+                    "Clearing stale _latest_transcript: %r",
+                    session._latest_transcript
+                )
+
+                session._latest_transcript = ""
+
         if ev.new_state == "speaking":
             print("TTS started - LLM streaming is working!")
+
+        elif ev.new_state == "listening":
+
+            session._agent_finished_speaking = True
+
+            logger.debug(
+                "Agent returned to listening; "
+                "_agent_finished_speaking=True "
+                "(dedup guard held)"
+            )
+
+            asyncio.create_task(
+                clear_stale_transcript()
+            )
 
     @session.on("metrics_collected")
     def on_metrics(ev):
